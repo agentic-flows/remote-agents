@@ -1,0 +1,13 @@
+{
+  // Linear team key
+  "team_key": "AGE",
+
+  // Repo name (detected from git remote)
+  "repo_name": "remote-agents",
+
+  // How issues are scoped to this repo in Linear
+  // "project" = uses a Linear Project named "remote-agents" (recommended)
+  // "label" = uses a repo:remote-agents label
+  // "both" = uses both project and label
+  "repo_scope": "project"
+}
