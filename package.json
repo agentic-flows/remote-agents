@@ -1,0 +1,30 @@
+{
+  "name": "remote-agents",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Run OpenCode coding agents remotely on Cloudflare infrastructure",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "types": "wrangler types",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-sdk/anthropic": "^1.0.0",
+    "@cloudflare/ai-chat": "^0.0.1",
+    "@opencode-ai/sdk": "^1.1.40",
+    "agents": "^0.0.1",
+    "ai": "^4.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@cloudflare/sandbox": "*",
+    "@types/node": "^24.10.1",
+    "typescript": "^5.9.3",
+    "wrangler": "^4.63.0"
+  },
+  "author": "",
+  "license": "MIT"
+}
