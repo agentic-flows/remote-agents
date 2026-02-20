@@ -78,6 +78,159 @@ npm run types        # Generate wrangler types
 
 ---
 
+## Agent Workflows: Local vs Remote
+
+This project supports two parallel workflows for running AI coding agents. Both use `lb` and Linear as the source of truth — they differ only in *where* the agent executes.
+
+| | Local (tmux + worktrees) | Remote (Orchestrator + containers) |
+|---|---|---|
+| **Execution** | `opencode serve` in a local tmux session | `opencode serve` in a Cloudflare Container |
+| **Orchestration** | lb plugin tools (`lb_dispatch`, `lb_check`, …) | Chat with the Orchestrator DO |
+| **State tracking** | lb issue description (port, tmux session) | `this.state.agents` in DO SQLite |
+| **When to use** | Local development | Deployed to Cloudflare |
+| **Linear integration** | `lb sync` on each agent's machine | Orchestrator calls Linear API directly |
+
+Both workflows are non-exclusive — you can run local agents while the remote Orchestrator manages its own containers.
+
+---
+
+## Remote Agents Workflow
+
+### The Orchestrator
+
+The Orchestrator is an `AIChatAgent` Durable Object. You chat with it in natural language and it manages remote coding agents on your behalf.
+
+**Endpoint:** `/agents/Orchestrator/main` (WebSocket)
+
+You interact with it via:
+- **Web dashboard** at `/` (chat UI using `useAgentChat`)
+- **WebSocket** directly using the Agents SDK
+- **`@callable` RPC** for structured data: `listAgents()`, `getAgent(issueId)`
+
+State persists across page reloads and DO hibernation — the Orchestrator remembers all running agents in DO SQLite (`this.state.agents`).
+
+### Orchestrator Tools
+
+The Orchestrator LLM has two sets of tools:
+
+#### Issue Management (Linear API)
+
+| Tool | Purpose |
+|------|---------|
+| `lb_ready` | List issues ready to work on (refined + unblocked) |
+| `lb_show` | Read full issue details, description, and relations |
+| `lb_blocked` | Show blocked issues with their blockers |
+| `lb_list` | Browse all issues, optionally filtered by status |
+| `lb_update` | Change an issue's status |
+| `lb_create` | Create a new issue in Linear |
+
+#### Container Lifecycle (Sandbox SDK)
+
+| Tool | Purpose |
+|------|---------|
+| `launch_agent` | Spin up a container + opencode for a Linear issue |
+| `check_agent` | Get status and session info for a running agent |
+| `message_agent` | Send follow-up instructions to a running agent |
+| `abort_agent` | Cancel the current operation (container stays up) |
+| `destroy_agent` | Tear down the container completely and remove from state |
+| `list_agents` | List all tracked agents with status and branch info |
+
+### Remote Agent Lifecycle
+
+```
+You: "launch AGE-42"
+  → Orchestrator calls lb_show to read the issue
+  → Calls launch_agent: spins up a Cloudflare Container
+  → Container runs entrypoint.sh:
+      1. Configures git identity
+      2. Authenticates gh with GH_TOKEN
+      3. Clones the repo
+      4. Checks out (or creates) branch AGE-42-<slug>
+      5. Runs lb onboard + lb sync
+      6. Claims the issue: lb update AGE-42 --status in_progress
+      7. Starts opencode serve on port 4096
+  → Orchestrator creates an opencode session, sends the task prompt
+  → Reports: "Agent launched on branch AGE-42-fix-auth (sandbox: agent-age-42)"
+
+You: "how's AGE-42?"
+  → Orchestrator calls check_agent
+  → Returns status, branch, sandbox ID, and session state
+
+You: "tell AGE-42 to also add tests"
+  → Orchestrator calls message_agent
+  → Forwards the message to the running opencode session
+
+You: "stop AGE-42"
+  → Orchestrator calls abort_agent
+  → Cancels the session; container stays up
+
+You: "destroy AGE-42"
+  → Orchestrator calls destroy_agent
+  → Tears down the Sandbox DO; removes from state
+```
+
+### Agent State
+
+Each agent is tracked in `this.state.agents` (DO SQLite), keyed by issue identifier:
+
+```typescript
+{
+  sandboxId: string;   // Sandbox DO name, e.g. "agent-age-42"
+  sessionId: string;   // opencode session ID
+  branch: string;      // git branch, e.g. "AGE-42-fix-auth"
+  status: 'launching' | 'running' | 'done' | 'failed' | 'aborted';
+  launchedAt: string;  // ISO timestamp
+}
+```
+
+State is set at every lifecycle transition (launching → running → aborted/done/failed) and persists across Orchestrator hibernation.
+
+### Configuration
+
+#### Required Secrets
+
+Set in `.dev.vars` for local development, Cloudflare secrets for production:
+
+| Secret | Purpose |
+|--------|---------|
+| `ANTHROPIC_API_KEY` | Powers the Orchestrator LLM + each container's opencode agent |
+| `GH_TOKEN` | GitHub auth for `gh pr create`, `git push`, repo cloning |
+| `LINEAR_API_KEY` | Direct Linear API access (Orchestrator tools + container lb sync) |
+| `GIT_AUTHOR_NAME` | Git commit author name (used in each container) |
+| `GIT_AUTHOR_EMAIL` | Git commit author email (used in each container) |
+
+Copy `.dev.vars.example` to `.dev.vars` and fill in values:
+
+```bash
+cp .dev.vars.example .dev.vars
+```
+
+#### wrangler.jsonc Bindings
+
+The Worker has two Durable Object bindings:
+
+- **`Sandbox`** — Cloudflare Containers (one per agent); `class_name: "Sandbox"` from `@cloudflare/sandbox`
+- **`Orchestrator`** — The AIChatAgent DO; `class_name: "Orchestrator"` from `src/orchestrator.ts`
+
+Both use SQLite (`new_sqlite_classes`) for persistent state.
+
+### Local vs Remote: Decision Guide
+
+**Use the remote Orchestrator when:**
+- Running agents in production (deployed to Cloudflare)
+- You want agents to persist without a local machine running
+- You want to manage multiple parallel agents via the dashboard
+- You're working from the chat UI or dashboard
+
+**Use the local lb plugin (tmux + worktrees) when:**
+- Developing locally with `npm run dev`
+- You want direct control over the agent process
+- You're the coordinator agent in a local session
+
+**Key principle:** Both workflows use `lb` and Linear as the source of truth. An agent launched remotely via the Orchestrator and an agent dispatched locally via `lb_dispatch` both sync to the same Linear project — they just run in different environments.
+
+---
+
 ## CRITICAL: Task Tracking with `lb`
 
 > **STOP. READ THIS CAREFULLY.**
