@@ -7,9 +7,6 @@
   "observability": {
     "enabled": true
   },
-  "assets": {
-    "not_found_handling": "single-page-application"
-  },
   "containers": [
     {
       "class_name": "Sandbox",
@@ -22,10 +19,6 @@
       {
         "class_name": "Sandbox",
         "name": "Sandbox"
-      },
-      {
-        "class_name": "Orchestrator",
-        "name": "Orchestrator"
       }
     ]
   },
@@ -33,6 +26,10 @@
     {
       "new_sqlite_classes": ["Sandbox", "Orchestrator"],
       "tag": "v1"
+    },
+    {
+      "deleted_classes": ["Orchestrator"],
+      "tag": "v2"
     }
   ]
 }

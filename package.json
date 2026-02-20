@@ -5,33 +5,19 @@
   "private": true,
   "description": "Run OpenCode coding agents remotely on Cloudflare infrastructure",
   "scripts": {
-    "dev": "vite dev",
-    "build": "vite build",
-    "preview": "vite build && vite preview",
-    "deploy": "vite build && wrangler deploy",
-    "start": "vite dev",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
     "types": "wrangler types",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "^3.0.0",
-    "@cloudflare/ai-chat": "^0.1.2",
-    "@opencode-ai/sdk": "1.1.40",
-    "agents": "^0.5.0",
-    "ai": "^6.0.0",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.4",
-    "zod": "^3.23.0"
+    "@opencode-ai/sdk": "1.1.40"
   },
   "devDependencies": {
     "@cloudflare/sandbox": "*",
-    "@cloudflare/vite-plugin": "^1.25.2",
     "@types/node": "^24.10.1",
-    "@types/react": "^19.2.14",
-    "@types/react-dom": "^19.2.3",
-    "@vitejs/plugin-react": "^5.1.4",
     "typescript": "^5.9.3",
-    "vite": "^7.3.1",
     "wrangler": "^4.63.0"
   },
   "author": "",
