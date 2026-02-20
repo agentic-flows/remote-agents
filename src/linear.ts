@@ -25,6 +25,12 @@ export interface LinearIssue {
       relatedIssue: { identifier: string; title: string; state: { name: string; type: string } };
     }[];
   };
+  inverseRelations: {
+    nodes: {
+      type: string;
+      issue: { identifier: string; title: string; state: { name: string; type: string } };
+    }[];
+  };
 }
 
 export interface LinearIssueCompact {
@@ -34,12 +40,12 @@ export interface LinearIssueCompact {
   state: { name: string; type: string };
 }
 
-// Map lb status names to Linear workflow state names
-// Linear uses title-case "In Progress" while lb uses snake_case "in_progress"
+// Map lb status names to Linear workflow state names.
+// These must match the ACTUAL state names in the Linear workspace.
 const LB_TO_LINEAR_STATE: Record<string, string> = {
-  todo_needs_refinement: 'Todo - Needs Refinement',
-  todo_refined: 'Todo - Refined',
-  todo_bug: 'Todo - Bug',
+  todo_needs_refinement: 'Todo Needs Refinement',
+  todo_refined: 'Todo Refined',
+  todo_bug: 'Todo Bug',
   in_progress: 'In Progress',
   in_review: 'In Review',
   done: 'Done',
@@ -81,14 +87,13 @@ async function linearQuery(
 
 /**
  * Get a single issue by its identifier (e.g. "AGE-172").
+ *
+ * Uses the `issue(id:)` query which accepts both UUIDs and identifiers.
  */
 export async function getIssue(apiKey: string, identifier: string): Promise<LinearIssue | null> {
-  const teamKey = identifier.split('-')[0];
-  const number = parseInt(identifier.split('-')[1], 10);
-
   const data = (await linearQuery(apiKey, `
-    query($teamKey: String!, $number: Float!) {
-      issueVcsByTeamKeyAndNumber(teamKey: $teamKey, number: $number) {
+    query($id: String!) {
+      issue(id: $id) {
         id
         identifier
         title
@@ -98,94 +103,110 @@ export async function getIssue(apiKey: string, identifier: string): Promise<Line
         parent { identifier title }
         children { nodes { identifier title state { name type } } }
         relations { nodes { type relatedIssue { identifier title state { name type } } } }
+        inverseRelations { nodes { type issue { identifier title state { name type } } } }
       }
     }
-  `, { teamKey, number })) as { issueVcsByTeamKeyAndNumber: LinearIssue | null };
+  `, { id: identifier })) as { issue: LinearIssue | null };
 
-  return data.issueVcsByTeamKeyAndNumber;
+  return data.issue;
 }
 
 /**
- * List issues for a team, optionally filtered by state type.
+ * List issues for a team, optionally filtered by state names.
+ *
+ * Uses the root `issues` query with `filter: { team: { key: { eq: ... } } }`
+ * instead of `team(id:)` which requires a UUID.
  */
 export async function listIssues(
   apiKey: string,
   teamKey: string,
   options?: { stateNames?: string[]; first?: number },
 ): Promise<LinearIssueCompact[]> {
-  const stateFilter = options?.stateNames?.length
-    ? `state: { name: { in: ${JSON.stringify(options.stateNames)} } }`
-    : '';
+  // Build filter dynamically but safely via variables
+  const variables: Record<string, unknown> = {
+    teamKey,
+    first: options?.first ?? 50,
+  };
+
+  // If state names are provided, include them as a variable
+  let stateFilter = '';
+  if (options?.stateNames?.length) {
+    variables.stateNames = options.stateNames;
+    stateFilter = ', state: { name: { in: $stateNames } }';
+  }
 
   const data = (await linearQuery(apiKey, `
-    query($teamKey: String!, $first: Int) {
-      team(id: $teamKey) {
-        issues(first: $first, ${stateFilter ? `filter: { ${stateFilter} }` : ''}) {
-          nodes {
-            identifier
-            title
-            priority
-            state { name type }
-          }
+    query($teamKey: String!, $first: Int${options?.stateNames?.length ? ', $stateNames: [String!]!' : ''}) {
+      issues(
+        filter: { team: { key: { eq: $teamKey } }${stateFilter} }
+        first: $first
+      ) {
+        nodes {
+          identifier
+          title
+          priority
+          state { name type }
         }
       }
     }
-  `, { teamKey, first: options?.first ?? 50 })) as { team: { issues: { nodes: LinearIssueCompact[] } } };
+  `, variables)) as { issues: { nodes: LinearIssueCompact[] } };
 
-  return data.team.issues.nodes;
+  return data.issues.nodes;
 }
 
 /**
- * Get issues ready to pick up (status = Todo - Refined or Todo - Bug, unblocked).
+ * Get issues ready to pick up (status = Todo Refined or Todo Bug, unblocked).
+ *
+ * Uses the root `issues` query with team key filter. Checks `inverseRelations`
+ * for blocking relationships — an issue is blocked if it has an inverseRelation
+ * of type "blocks" from a non-completed issue.
  */
 export async function getReadyIssues(apiKey: string, teamKey: string): Promise<LinearIssueCompact[]> {
-  // Query for refined and bug issues
   const data = (await linearQuery(apiKey, `
-    query($teamKey: String!) {
-      team(id: $teamKey) {
-        issues(
-          filter: {
-            state: { name: { in: ["Todo - Refined", "Todo - Bug"] } }
-          }
-          first: 50
-        ) {
-          nodes {
-            identifier
-            title
-            priority
-            state { name type }
-            relations {
-              nodes {
-                type
-                relatedIssue {
-                  identifier
-                  state { name type }
-                }
+    query($teamKey: String!, $stateNames: [String!]!) {
+      issues(
+        filter: {
+          team: { key: { eq: $teamKey } }
+          state: { name: { in: $stateNames } }
+        }
+        first: 50
+      ) {
+        nodes {
+          identifier
+          title
+          priority
+          state { name type }
+          inverseRelations {
+            nodes {
+              type
+              issue {
+                identifier
+                state { name type }
               }
             }
           }
         }
       }
     }
-  `, { teamKey })) as {
-    team: {
-      issues: {
-        nodes: (LinearIssueCompact & {
-          relations: {
-            nodes: {
-              type: string;
-              relatedIssue: { identifier: string; state: { name: string; type: string } };
-            }[];
-          };
-        })[];
-      };
+  `, { teamKey, stateNames: ['Todo Refined', 'Todo Bug'] })) as {
+    issues: {
+      nodes: (LinearIssueCompact & {
+        inverseRelations: {
+          nodes: {
+            type: string;
+            issue: { identifier: string; state: { name: string; type: string } };
+          }[];
+        };
+      })[];
     };
   };
 
-  // Filter out blocked issues (those with "blocks" relation where blocker is not done)
-  return data.team.issues.nodes.filter((issue) => {
-    const blockers = issue.relations.nodes.filter(
-      (rel) => rel.type === 'blocks' && rel.relatedIssue.state.type !== 'completed',
+  // Filter out blocked issues: those with inverseRelations of type "blocks"
+  // where the blocking issue is not yet completed.
+  // inverseRelation type "blocks" + issue = the blocker (the issue that blocks this one).
+  return data.issues.nodes.filter((issue) => {
+    const blockers = issue.inverseRelations.nodes.filter(
+      (rel) => rel.type === 'blocks' && rel.issue.state.type !== 'completed',
     );
     return blockers.length === 0;
   });
@@ -193,32 +214,34 @@ export async function getReadyIssues(apiKey: string, teamKey: string): Promise<L
 
 /**
  * Get blocked issues with their blockers.
+ *
+ * An issue is "blocked" if it has an inverseRelation of type "blocks" from
+ * a non-completed issue. The `issue` field in inverseRelations is the blocker.
  */
 export async function getBlockedIssues(apiKey: string, teamKey: string): Promise<
   { issue: LinearIssueCompact; blockedBy: { identifier: string; title: string }[] }[]
 > {
   const data = (await linearQuery(apiKey, `
     query($teamKey: String!) {
-      team(id: $teamKey) {
-        issues(
-          filter: {
-            state: { type: { nin: ["completed", "canceled"] } }
-          }
-          first: 100
-        ) {
-          nodes {
-            identifier
-            title
-            priority
-            state { name type }
-            relations {
-              nodes {
-                type
-                relatedIssue {
-                  identifier
-                  title
-                  state { name type }
-                }
+      issues(
+        filter: {
+          team: { key: { eq: $teamKey } }
+          state: { type: { nin: ["completed", "canceled"] } }
+        }
+        first: 100
+      ) {
+        nodes {
+          identifier
+          title
+          priority
+          state { name type }
+          inverseRelations {
+            nodes {
+              type
+              issue {
+                identifier
+                title
+                state { name type }
               }
             }
           }
@@ -226,26 +249,24 @@ export async function getBlockedIssues(apiKey: string, teamKey: string): Promise
       }
     }
   `, { teamKey })) as {
-    team: {
-      issues: {
-        nodes: (LinearIssueCompact & {
-          relations: {
-            nodes: {
-              type: string;
-              relatedIssue: { identifier: string; title: string; state: { name: string; type: string } };
-            }[];
-          };
-        })[];
-      };
+    issues: {
+      nodes: (LinearIssueCompact & {
+        inverseRelations: {
+          nodes: {
+            type: string;
+            issue: { identifier: string; title: string; state: { name: string; type: string } };
+          }[];
+        };
+      })[];
     };
   };
 
   const blocked: { issue: LinearIssueCompact; blockedBy: { identifier: string; title: string }[] }[] = [];
 
-  for (const issue of data.team.issues.nodes) {
-    const openBlockers = issue.relations.nodes
-      .filter((rel) => rel.type === 'blocks' && rel.relatedIssue.state.type !== 'completed')
-      .map((rel) => ({ identifier: rel.relatedIssue.identifier, title: rel.relatedIssue.title }));
+  for (const issue of data.issues.nodes) {
+    const openBlockers = issue.inverseRelations.nodes
+      .filter((rel) => rel.type === 'blocks' && rel.issue.state.type !== 'completed')
+      .map((rel) => ({ identifier: rel.issue.identifier, title: rel.issue.title }));
 
     if (openBlockers.length > 0) {
       blocked.push({ issue, blockedBy: openBlockers });
@@ -253,6 +274,25 @@ export async function getBlockedIssues(apiKey: string, teamKey: string): Promise
   }
 
   return blocked;
+}
+
+/**
+ * Look up the team UUID from a team key (e.g. "AGE" → UUID).
+ * Cached per request — called internally by functions that need it.
+ */
+async function getTeamId(apiKey: string, teamKey: string): Promise<string> {
+  const data = (await linearQuery(apiKey, `
+    query($teamKey: String!) {
+      teams(filter: { key: { eq: $teamKey } }) {
+        nodes { id }
+      }
+    }
+  `, { teamKey })) as { teams: { nodes: { id: string }[] } };
+
+  if (data.teams.nodes.length === 0) {
+    throw new Error(`Team with key "${teamKey}" not found`);
+  }
+  return data.teams.nodes[0].id;
 }
 
 /**
@@ -270,26 +310,30 @@ export async function updateIssueStatus(
     );
   }
 
-  // First get the issue to find its team
+  // Get the issue to find its UUID for the mutation
   const issue = await getIssue(apiKey, identifier);
   if (!issue) throw new Error(`Issue ${identifier} not found`);
 
-  // Find the target workflow state
+  // Look up the team UUID via teams query with key filter
   const teamKey = identifier.split('-')[0];
+  const teamId = await getTeamId(apiKey, teamKey);
+
+  // Find the target workflow state using the team UUID
   const statesData = (await linearQuery(apiKey, `
-    query($teamKey: String!) {
-      team(id: $teamKey) {
+    query($teamId: String!) {
+      team(id: $teamId) {
         states { nodes { id name type } }
       }
     }
-  `, { teamKey })) as { team: { states: { nodes: { id: string; name: string; type: string }[] } } };
+  `, { teamId })) as { team: { states: { nodes: { id: string; name: string; type: string }[] } } };
 
   const targetState = statesData.team.states.nodes.find((s) => s.name === linearStateName);
   if (!targetState) {
-    throw new Error(`Workflow state "${linearStateName}" not found in team ${teamKey}`);
+    const available = statesData.team.states.nodes.map((s) => s.name).join(', ');
+    throw new Error(`Workflow state "${linearStateName}" not found in team ${teamKey}. Available: ${available}`);
   }
 
-  // Update
+  // Update the issue
   await linearQuery(apiKey, `
     mutation($id: String!, $stateId: String!) {
       issueUpdate(id: $id, input: { stateId: $stateId }) {
@@ -310,26 +354,22 @@ export async function createIssue(
   title: string,
   options?: { description?: string; parentIdentifier?: string; labels?: string[] },
 ): Promise<{ identifier: string; title: string }> {
-  // Get team ID
-  const teamData = (await linearQuery(apiKey, `
-    query($teamKey: String!) {
-      team(id: $teamKey) { id }
-    }
-  `, { teamKey })) as { team: { id: string } };
+  // Look up team UUID via teams query with key filter
+  const teamId = await getTeamId(apiKey, teamKey);
 
   const input: Record<string, unknown> = {
-    teamId: teamData.team.id,
+    teamId,
     title,
     description: options?.description ?? '',
   };
 
-  // If parent, find its ID
+  // If parent, find its UUID
   if (options?.parentIdentifier) {
     const parent = await getIssue(apiKey, options.parentIdentifier);
     if (parent) input.parentId = parent.id;
   }
 
-  // Create labels if specified
+  // Attach labels if specified (look up by name, skip missing ones with warning)
   if (options?.labels?.length) {
     const labelsData = (await linearQuery(apiKey, `
       query($teamId: String!) {
@@ -337,14 +377,19 @@ export async function createIssue(
           labels { nodes { id name } }
         }
       }
-    `, { teamId: teamData.team.id })) as { team: { labels: { nodes: { id: string; name: string }[] } } };
+    `, { teamId })) as { team: { labels: { nodes: { id: string; name: string }[] } } };
 
-    const labelIds = options.labels.map((name) => {
+    const labelIds: string[] = [];
+    for (const name of options.labels) {
       const found = labelsData.team.labels.nodes.find(
         (l) => l.name.toLowerCase() === name.toLowerCase(),
       );
-      return found?.id;
-    }).filter(Boolean);
+      if (found) {
+        labelIds.push(found.id);
+      }
+      // Labels not found are silently skipped — Linear auto-creates them
+      // in the UI but not via API. Consider creating them if needed.
+    }
 
     if (labelIds.length) input.labelIds = labelIds;
   }

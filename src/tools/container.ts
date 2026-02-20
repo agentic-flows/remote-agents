@@ -182,7 +182,7 @@ export function createContainerTools(
 
     check_agent: tool({
       description:
-        'Check the status of a running agent. Returns its current state and recent activity from the opencode session.',
+        'Check the status of a running agent. Returns its current state and session info from the opencode session.',
       inputSchema: z.object({
         issueId: z.string().describe('Linear issue identifier, e.g. "AGE-172"'),
       }),
@@ -200,17 +200,19 @@ export function createContainerTools(
             `  Launched: ${entry.launchedAt}`,
           ];
 
-          // If running, try to get recent messages
+          // If running, try to get session info
           if (entry.status === 'running' && entry.sessionId) {
             try {
               const sandbox = getSandbox(env.Sandbox, entry.sandboxId);
               const { client } = await getOpencodeClient(sandbox, env);
 
-              const messages = await client.session.list();
-              const session = messages.data?.find((s: { id: string }) => s.id === entry.sessionId);
+              const sessions = await client.session.list();
+              const session = sessions.data?.find((s: { id: string }) => s.id === entry.sessionId);
 
               if (session) {
-                lines.push(`  Session: active`);
+                lines.push(`  Session: active (ID: ${entry.sessionId})`);
+              } else {
+                lines.push(`  Session: not found (may have completed or been destroyed)`);
               }
             } catch (e) {
               lines.push(`  Session: unable to check (${e instanceof Error ? e.message : 'error'})`);
@@ -286,7 +288,7 @@ export function createContainerTools(
             ...updatedState,
             agents: {
               ...updatedState.agents,
-              [issueId]: { ...updatedState.agents[issueId], status: 'failed' },
+              [issueId]: { ...updatedState.agents[issueId], status: 'aborted' },
             },
           });
 

@@ -9,6 +9,7 @@
  * WebSocket upgrades and routing to the correct DO instance.
  */
 import { routeAgentRequest } from 'agents';
+import { assertRequiredSecrets } from './secrets.js';
 
 // Re-export Durable Object classes so wrangler can find them
 export { Sandbox } from '@cloudflare/sandbox';
@@ -19,6 +20,9 @@ import './env.js';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    // Fail fast if required secrets are missing
+    assertRequiredSecrets(env);
+
     // routeAgentRequest handles:
     //   /agents/Orchestrator/:name  → Orchestrator DO (chat WebSocket)
     //   /agents/Sandbox/:name       → Sandbox DO

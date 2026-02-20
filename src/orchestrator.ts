@@ -30,7 +30,7 @@ export interface AgentEntry {
   sandboxId: string;
   sessionId: string;
   branch: string;
-  status: 'launching' | 'running' | 'done' | 'failed';
+  status: 'launching' | 'running' | 'done' | 'failed' | 'aborted';
   launchedAt: string;
 }
 
@@ -106,7 +106,7 @@ export class Orchestrator extends AIChatAgent<Env, OrchestratorState> {
   /**
    * Handle incoming chat messages — the core of the orchestrator.
    */
-  async onChatMessage(onFinish: any) {
+  async onChatMessage(onFinish: Parameters<AIChatAgent['onChatMessage']>[0]) {
     const anthropic = createAnthropic({ apiKey: this.env.ANTHROPIC_API_KEY });
 
     // Build tools with access to env and state
@@ -125,7 +125,11 @@ export class Orchestrator extends AIChatAgent<Env, OrchestratorState> {
       messages: await convertToModelMessages(this.messages),
       tools,
       stopWhen: stepCountIs(10), // Allow multi-step tool use
-      onFinish,
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- The parent class
+      // provides onFinish typed for generic ToolSet, but streamText parameterizes it
+      // with our concrete tool types. The shapes are compatible at runtime; we cast to
+      // bridge the contravariant generic constraint.
+      onFinish: onFinish as any,
     });
 
     return result.toUIMessageStreamResponse();
