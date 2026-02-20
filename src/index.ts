@@ -30,9 +30,6 @@ import './env.js';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    // Fail fast if required secrets are missing
-    assertRequiredSecrets(env);
-
     const url = new URL(request.url);
 
     // Serve the dashboard at / and /dashboard
@@ -49,6 +46,9 @@ export default {
     if (url.pathname === '/health') {
       return Response.json({ status: 'ok', timestamp: new Date().toISOString() });
     }
+
+    // Agent routes require secrets — fail fast with a clear error
+    assertRequiredSecrets(env);
 
     // routeAgentRequest handles:
     //   /agents/Orchestrator/:name  → Orchestrator DO (chat WebSocket)
