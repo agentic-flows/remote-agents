@@ -12,11 +12,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ai-sdk/anthropic": "^1.0.0",
-    "@cloudflare/ai-chat": "^0.0.1",
+    "@ai-sdk/anthropic": "^3.0.0",
+    "@cloudflare/ai-chat": "^0.1.2",
     "@opencode-ai/sdk": "^1.1.40",
-    "agents": "^0.0.1",
-    "ai": "^4.0.0",
+    "agents": "^0.5.0",
+    "ai": "^6.0.0",
     "zod": "^3.23.0"
   },
   "devDependencies": {
