@@ -4,18 +4,36 @@
  * Each tool operates on the orchestrator's `this.state.agents` registry
  * and the Sandbox DO binding to launch, check, message, and abort
  * remote coding agents running opencode inside containers.
+ *
+ * SDK usage follows the opencode-remote example from sandbox-sdk.
  */
 import { tool } from 'ai';
 import { z } from 'zod';
 import { getSandbox } from '@cloudflare/sandbox';
 import { createOpencode } from '@cloudflare/sandbox/opencode';
-import type { OpencodeClient } from '@opencode-ai/sdk/v2/client';
+import type { Config, OpencodeClient } from '@opencode-ai/sdk';
 import { getContainerEnv } from '../secrets.js';
 import { getIssue } from '../linear.js';
 import type { AgentEntry, OrchestratorState } from '../orchestrator.js';
 
 // Repo URL — the orchestrator always works with this repo
 const REPO_URL = 'https://github.com/agentic-flows/remote-agents.git';
+const WORK_DIR = '/home/user/workspace';
+
+/**
+ * Build opencode config from env.
+ */
+function getConfig(env: Env): Config {
+  return {
+    provider: {
+      anthropic: {
+        options: {
+          apiKey: env.ANTHROPIC_API_KEY,
+        },
+      },
+    },
+  };
+}
 
 /**
  * Helper: get or create an opencode SDK client for a sandbox.
@@ -25,14 +43,8 @@ async function getOpencodeClient(
   env: Env,
 ) {
   return createOpencode<OpencodeClient>(sandbox, {
-    directory: '/home/user/workspace',
-    config: {
-      provider: {
-        anthropic: {
-          options: { apiKey: env.ANTHROPIC_API_KEY },
-        },
-      },
-    },
+    directory: WORK_DIR,
+    config: getConfig(env),
   });
 }
 
@@ -90,7 +102,7 @@ export function createContainerTools(
             agents: { ...state.agents, [issueId]: newEntry },
           });
 
-          // Get sandbox and create opencode client
+          // Get sandbox
           const sandbox = getSandbox(env.Sandbox, sandboxId);
 
           // Set env vars on the sandbox for the entrypoint
@@ -102,13 +114,18 @@ export function createContainerTools(
             ISSUE_ID: issueId,
           });
 
-          // Create the opencode server + client
+          // Clone the repo into the workspace
+          await sandbox.gitCheckout(REPO_URL, {
+            targetDir: WORK_DIR,
+          });
+
+          // Get typed SDK client
           const { client } = await getOpencodeClient(sandbox, env);
 
           // Create an opencode session
           const session = await client.session.create({
-            title: `${issueId}: ${issue.title}`,
-            directory: '/home/user/workspace',
+            body: { title: `${issueId}: ${issue.title}` },
+            query: { directory: WORK_DIR },
           });
 
           if (!session.data) {
@@ -138,14 +155,16 @@ export function createContainerTools(
             '4. Push the branch and create a PR using `gh pr create`.',
             `5. Run \`lb update ${issueId} --status in_review\` when the PR is created.`,
             '',
-            `You are working on branch \`${branchName}\` in /home/user/workspace.`,
+            `You are working on branch \`${branchName}\` in ${WORK_DIR}.`,
           );
 
           // Send the task
           await client.session.prompt({
-            sessionID: sessionId,
-            directory: '/home/user/workspace',
-            parts: [{ type: 'text', text: taskLines.join('\n') }],
+            path: { id: sessionId },
+            query: { directory: WORK_DIR },
+            body: {
+              parts: [{ type: 'text', text: taskLines.join('\n') }],
+            },
           });
 
           // Update state: running
@@ -249,9 +268,11 @@ export function createContainerTools(
           const { client } = await getOpencodeClient(sandbox, env);
 
           await client.session.prompt({
-            sessionID: entry.sessionId,
-            directory: '/home/user/workspace',
-            parts: [{ type: 'text', text: message }],
+            path: { id: entry.sessionId },
+            query: { directory: WORK_DIR },
+            body: {
+              parts: [{ type: 'text', text: message }],
+            },
           });
 
           return `Message sent to agent for ${issueId}.`;
@@ -277,7 +298,9 @@ export function createContainerTools(
             try {
               const sandbox = getSandbox(env.Sandbox, entry.sandboxId);
               const { client } = await getOpencodeClient(sandbox, env);
-              await client.session.abort({ sessionID: entry.sessionId });
+              await client.session.abort({
+                path: { id: entry.sessionId },
+              });
             } catch {
               // Container may already be stopped
             }
