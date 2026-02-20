@@ -5,9 +5,11 @@
   "private": true,
   "description": "Run OpenCode coding agents remotely on Cloudflare infrastructure",
   "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "start": "wrangler dev",
+    "build:dashboard": "node scripts/build-dashboard.mjs",
+    "build:dashboard:dev": "node scripts/build-dashboard.mjs --dev",
+    "deploy": "npm run build:dashboard && wrangler deploy",
+    "dev": "npm run build:dashboard:dev && wrangler dev",
+    "start": "npm run dev",
     "types": "wrangler types",
     "typecheck": "tsc --noEmit"
   },
@@ -17,11 +19,15 @@
     "@opencode-ai/sdk": "^1.1.40",
     "agents": "^0.5.0",
     "ai": "^6.0.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.4",
     "zod": "^3.23.0"
   },
   "devDependencies": {
     "@cloudflare/sandbox": "*",
     "@types/node": "^24.10.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
     "typescript": "^5.9.3",
     "wrangler": "^4.63.0"
   },
