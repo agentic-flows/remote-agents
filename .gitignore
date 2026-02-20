@@ -204,3 +204,7 @@ worker-configuration.d.ts
 .lb/cache.db
 .lb/cache.db-shm
 .lb/cache.db-wal
+
+### Local binaries ###
+# Pre-compiled lb binary (COPY'd into Docker image, not tracked in git)
+bin/
