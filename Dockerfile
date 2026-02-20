@@ -24,14 +24,8 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 COPY bin/lb /usr/local/bin/lb
 RUN chmod +x /usr/local/bin/lb
 
-# Copy entrypoint script
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
-
 # Workspace directory for cloned repos
 RUN mkdir -p /home/user/workspace
 
 # Expose OpenCode server port (default)
 EXPOSE 4096
-
-ENTRYPOINT ["/entrypoint.sh"]
