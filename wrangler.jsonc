@@ -7,11 +7,9 @@
   "observability": {
     "enabled": true
   },
-  // Import the pre-built dashboard HTML as a text module.
-  // The dashboard is built to public/ by scripts/build-dashboard.mjs.
-  "rules": [
-    { "type": "Text", "globs": ["public/*.html"], "fallthrough": true }
-  ],
+  "assets": {
+    "not_found_handling": "single-page-application"
+  },
   "containers": [
     {
       "class_name": "Sandbox",
