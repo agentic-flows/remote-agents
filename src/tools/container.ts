@@ -5,7 +5,14 @@
  * and the Sandbox DO binding to launch, check, message, and abort
  * remote coding agents running opencode inside containers.
  *
- * SDK usage follows the opencode-remote example from sandbox-sdk.
+ * Architecture follows the sandbox-sdk opencode-remote example:
+ * - Worker calls sandbox.gitCheckout() to clone the repo
+ * - Worker calls createOpencode() to start opencode serve inside container
+ * - Worker uses the returned SDK client to create sessions and send prompts
+ * - No custom entrypoint — the sandbox SDK manages the opencode lifecycle
+ *
+ * Additional container setup (gh auth, lb, git config, branch creation)
+ * is done via sandbox.exec() before starting opencode.
  */
 import { tool } from 'ai';
 import { z } from 'zod';
@@ -36,16 +43,72 @@ function getConfig(env: Env): Config {
 }
 
 /**
- * Helper: get or create an opencode SDK client for a sandbox.
+ * Set up the container environment before starting opencode.
+ *
+ * Runs commands inside the container via sandbox.exec() to:
+ * 1. Set env vars (secrets)
+ * 2. Configure git identity
+ * 3. Authenticate gh
+ * 4. Clone the repo
+ * 5. Create/checkout the branch
+ * 6. Set up lb (if LINEAR_API_KEY present)
  */
-async function getOpencodeClient(
+async function setupContainer(
   sandbox: ReturnType<typeof getSandbox>,
   env: Env,
+  branchName: string,
+  issueId: string,
 ) {
-  return createOpencode<OpencodeClient>(sandbox, {
-    directory: WORK_DIR,
-    config: getConfig(env),
+  const containerEnv = getContainerEnv(env);
+
+  // Inject secrets as env vars
+  await sandbox.setEnvVars({
+    ...containerEnv,
+    REPO_URL,
+    BRANCH_NAME: branchName,
+    ISSUE_ID: issueId,
   });
+
+  // Configure git identity
+  if (env.GIT_AUTHOR_NAME) {
+    await sandbox.exec(`git config --global user.name "${env.GIT_AUTHOR_NAME}"`);
+  }
+  if (env.GIT_AUTHOR_EMAIL) {
+    await sandbox.exec(`git config --global user.email "${env.GIT_AUTHOR_EMAIL}"`);
+  }
+  await sandbox.exec(`git config --global --add safe.directory ${WORK_DIR}`);
+
+  // Authenticate gh
+  if (env.GH_TOKEN) {
+    await sandbox.exec(`echo "${env.GH_TOKEN}" | gh auth login --with-token`);
+  }
+
+  // Clone the repo (use sandbox.gitCheckout like the reference example)
+  await sandbox.gitCheckout(REPO_URL, { targetDir: WORK_DIR });
+
+  // Create or checkout the branch
+  const remoteBranchCheck = await sandbox.exec(
+    `cd ${WORK_DIR} && git ls-remote --exit-code --heads origin "${branchName}" 2>/dev/null && echo EXISTS || echo NEW`,
+  );
+  const branchExists = remoteBranchCheck.stdout?.includes('EXISTS');
+
+  if (branchExists) {
+    await sandbox.exec(`cd ${WORK_DIR} && git checkout -b "${branchName}" "origin/${branchName}"`);
+  } else {
+    await sandbox.exec(`cd ${WORK_DIR} && git checkout -b "${branchName}"`);
+  }
+
+  // Set up lb (if LINEAR_API_KEY is set and .lb/config.jsonc exists)
+  if (env.LINEAR_API_KEY) {
+    const lbConfigCheck = await sandbox.exec(`test -f ${WORK_DIR}/.lb/config.jsonc && echo YES || echo NO`);
+    if (lbConfigCheck.stdout?.includes('YES')) {
+      await sandbox.exec(`cd ${WORK_DIR} && lb onboard --non-interactive 2>/dev/null || lb onboard || true`);
+      await sandbox.exec(`cd ${WORK_DIR} && lb sync || true`);
+    }
+
+    // Claim the issue
+    await sandbox.exec(`cd ${WORK_DIR} && lb update ${issueId} --status in_progress || true`);
+  }
 }
 
 /**
@@ -82,7 +145,7 @@ export function createContainerTools(
             return `Agent for ${issueId} is already ${existing.status} (sandbox: ${existing.sandboxId}).`;
           }
 
-          // Get issue details
+          // Get issue details from Linear
           const issue = await getIssue(env.LINEAR_API_KEY, issueId);
           if (!issue) return `Issue ${issueId} not found in Linear.`;
 
@@ -102,25 +165,18 @@ export function createContainerTools(
             agents: { ...state.agents, [issueId]: newEntry },
           });
 
-          // Get sandbox
+          // Get sandbox handle
           const sandbox = getSandbox(env.Sandbox, sandboxId);
 
-          // Set env vars on the sandbox for the entrypoint
-          const containerEnv = getContainerEnv(env);
-          await sandbox.setEnvVars({
-            ...containerEnv,
-            REPO_URL,
-            BRANCH_NAME: branchName,
-            ISSUE_ID: issueId,
-          });
+          // Set up the container: env vars, git, gh, repo clone, branch, lb
+          await setupContainer(sandbox, env, branchName, issueId);
 
-          // Clone the repo into the workspace
-          await sandbox.gitCheckout(REPO_URL, {
-            targetDir: WORK_DIR,
+          // Start opencode serve and get typed SDK client
+          // (createOpencode starts `opencode serve` inside the container)
+          const { client } = await createOpencode<OpencodeClient>(sandbox, {
+            directory: WORK_DIR,
+            config: getConfig(env),
           });
-
-          // Get typed SDK client
-          const { client } = await getOpencodeClient(sandbox, env);
 
           // Create an opencode session
           const session = await client.session.create({
@@ -158,7 +214,7 @@ export function createContainerTools(
             `You are working on branch \`${branchName}\` in ${WORK_DIR}.`,
           );
 
-          // Send the task
+          // Send the task prompt
           await client.session.prompt({
             path: { id: sessionId },
             query: { directory: WORK_DIR },
@@ -201,7 +257,7 @@ export function createContainerTools(
 
     check_agent: tool({
       description:
-        'Check the status of a running agent. Returns its current state and session info from the opencode session.',
+        'Check the status of a running agent. Returns its current state and session info.',
       inputSchema: z.object({
         issueId: z.string().describe('Linear issue identifier, e.g. "AGE-172"'),
       }),
@@ -219,11 +275,13 @@ export function createContainerTools(
             `  Launched: ${entry.launchedAt}`,
           ];
 
-          // If running, try to get session info
           if (entry.status === 'running' && entry.sessionId) {
             try {
               const sandbox = getSandbox(env.Sandbox, entry.sandboxId);
-              const { client } = await getOpencodeClient(sandbox, env);
+              const { client } = await createOpencode<OpencodeClient>(sandbox, {
+                directory: WORK_DIR,
+                config: getConfig(env),
+              });
 
               const sessions = await client.session.list();
               const session = sessions.data?.find((s: { id: string }) => s.id === entry.sessionId);
@@ -231,7 +289,7 @@ export function createContainerTools(
               if (session) {
                 lines.push(`  Session: active (ID: ${entry.sessionId})`);
               } else {
-                lines.push(`  Session: not found (may have completed or been destroyed)`);
+                lines.push(`  Session: not found (may have completed)`);
               }
             } catch (e) {
               lines.push(`  Session: unable to check (${e instanceof Error ? e.message : 'error'})`);
@@ -265,7 +323,10 @@ export function createContainerTools(
           }
 
           const sandbox = getSandbox(env.Sandbox, entry.sandboxId);
-          const { client } = await getOpencodeClient(sandbox, env);
+          const { client } = await createOpencode<OpencodeClient>(sandbox, {
+            directory: WORK_DIR,
+            config: getConfig(env),
+          });
 
           await client.session.prompt({
             path: { id: entry.sessionId },
@@ -297,7 +358,10 @@ export function createContainerTools(
           if (entry.status === 'running' && entry.sessionId) {
             try {
               const sandbox = getSandbox(env.Sandbox, entry.sandboxId);
-              const { client } = await getOpencodeClient(sandbox, env);
+              const { client } = await createOpencode<OpencodeClient>(sandbox, {
+                directory: WORK_DIR,
+                config: getConfig(env),
+              });
               await client.session.abort({
                 path: { id: entry.sessionId },
               });
@@ -334,7 +398,6 @@ export function createContainerTools(
           const entry = state.agents[issueId];
           if (!entry) return `No agent found for ${issueId}.`;
 
-          // Try to destroy the sandbox
           try {
             const sandbox = getSandbox(env.Sandbox, entry.sandboxId);
             await sandbox.destroy();
@@ -342,7 +405,6 @@ export function createContainerTools(
             // Container may already be destroyed
           }
 
-          // Remove from state
           const updatedState = getState();
           const { [issueId]: _, ...remaining } = updatedState.agents;
           setState({ ...updatedState, agents: remaining });
