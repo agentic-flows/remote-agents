@@ -323,10 +323,15 @@ const getDefaultMcp = (_env: Env): Config['mcp'] => ({
 });
 
 const getConfig = (env: Env, extraMcp?: Config['mcp']): Config => ({
-  // We use free models (opencode/big-pickle etc.) which route through
-  // opencode's built-in proxy — no API key needed. Don't configure
-  // the Anthropic provider since the key is out of credits (AGE-246)
-  // and it causes confusion when opencode tries to use it.
+  provider: {
+    // The opencode provider hosts free models (big-pickle, gpt-5-nano, etc.)
+    // It requires an API key obtained via `opencode auth login`.
+    // The sandbox SDK extracts this and sets OPENCODE_API_KEY env var
+    // for the opencode server process (see @cloudflare/sandbox/opencode).
+    opencode: {
+      options: { apiKey: env.OPENCODE_API_KEY },
+    },
+  },
   mcp: {
     ...getDefaultMcp(env),
     ...extraMcp,
