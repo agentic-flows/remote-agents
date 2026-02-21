@@ -4,6 +4,7 @@
  * Spins up a Sandbox container running opencode serve, then routes:
  *
  *  GET  /                        → opencode web UI
+ *  /agents/orchestrator/*        → Orchestrator DO (WebSocket chat)
  *  POST /api/dispatch            → dispatch lb issue to remote agent
  *  POST /api/kickoff             → raw prompt (no lb)
  *  GET  /api/session/:id         → session status
@@ -20,6 +21,7 @@
  */
 import { getSandbox } from '@cloudflare/sandbox';
 import { proxyToOpencode } from '@cloudflare/sandbox/opencode';
+import { routeAgentRequest } from 'agents';
 import { AGENT_PROFILES, getConfig, getServer } from './config.js';
 import { handleDispatch } from './handlers/dispatch.js';
 import { handleKickoff } from './handlers/kickoff.js';
@@ -27,8 +29,9 @@ import { handleMessages, handleSessionStatus, handleFollowUp, handleListSessions
 import { handleExec } from './handlers/exec.js';
 import { handleWorkspaceSave, handleWorkspaceList, handleWorkspaceDelete, handleWorkspaceFile } from './handlers/workspace.js';
 
-// Re-export Sandbox DO class (required by wrangler binding)
+// Re-export DO classes (required by wrangler bindings)
 export { Sandbox } from './sandbox.js';
+export { Orchestrator } from './orchestrator.js';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -38,6 +41,13 @@ export default {
     // Health check
     if (url.pathname === '/health') {
       return Response.json({ status: 'ok', timestamp: new Date().toISOString() });
+    }
+
+    // --- Orchestrator DO (WebSocket chat agent) ---
+    // Routes: /agents/orchestrator/* via CF Agents SDK
+    const agentResponse = await routeAgentRequest(request, env);
+    if (agentResponse) {
+      return agentResponse;
     }
 
     // --- API routes ---

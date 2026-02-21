@@ -25,6 +25,10 @@
       {
         "class_name": "Sandbox",
         "name": "Sandbox"
+      },
+      {
+        "class_name": "Orchestrator",
+        "name": "Orchestrator"
       }
     ]
   },
@@ -36,6 +40,10 @@
     {
       "deleted_classes": ["Orchestrator"],
       "tag": "v2"
+    },
+    {
+      "new_sqlite_classes": ["Orchestrator"],
+      "tag": "v3"
     }
   ]
 }
