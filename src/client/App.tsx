@@ -16,12 +16,34 @@ interface ChatMessage {
 
 const WORKLET_CODE = `
 class PcmCaptureProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    // Buffer ~200ms of audio before sending (reduces WS messages from 125/s to 5/s)
+    // At 16kHz: 200ms = 3200 samples. Each process() call = 128 samples = 25 calls.
+    this._buffer = new Float32Array(3200);
+    this._offset = 0;
+  }
   process(inputs) {
     const input = inputs[0];
     if (input && input[0] && input[0].length > 0) {
-      // input[0] is Float32Array at whatever sampleRate the context uses
-      // We need to post it to the main thread for resampling + sending
-      this.port.postMessage(input[0].slice());
+      const samples = input[0];
+      const remaining = this._buffer.length - this._offset;
+      if (samples.length >= remaining) {
+        // Fill the rest of the buffer and flush
+        this._buffer.set(samples.subarray(0, remaining), this._offset);
+        this.port.postMessage(this._buffer.slice());
+        // Start new buffer with leftover samples
+        const leftover = samples.length - remaining;
+        this._offset = 0;
+        if (leftover > 0) {
+          this._buffer.set(samples.subarray(remaining), 0);
+          this._offset = leftover;
+        }
+      } else {
+        // Accumulate into buffer
+        this._buffer.set(samples, this._offset);
+        this._offset += samples.length;
+      }
     }
     return true;
   }
