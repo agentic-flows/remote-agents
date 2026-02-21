@@ -111,21 +111,15 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
     return this.buildTools();
   }
 
-  // Browser needs linear16 at 24kHz (not Twilio mulaw 8kHz)
+  // Browser needs linear16/24kHz (not Twilio mulaw/8kHz)
   protected override getTTSEncoding(): string { return 'linear16'; }
   protected override getTTSSampleRate(): string { return '24000'; }
+  protected override getTTSSpeaker(): string { return 'asteria'; }
 
   // ---------------------------------------------------------------------------
   // Browser WebSocket transport (like MyPhoneAgent's Twilio transport)
   // ---------------------------------------------------------------------------
 
-  /**
-   * Handle incoming WebSocket messages. The Agent SDK wrapper calls this
-   * after handling protocol messages (RPC, state updates).
-   *
-   * Binary frames = raw PCM16 16kHz audio from browser mic.
-   * JSON voice:start/stop = voice mode control.
-   */
   async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
     // Binary frames = raw PCM audio from browser mic
     if (message instanceof ArrayBuffer) {
@@ -155,43 +149,25 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
     // Everything else: SDK already handled RPC/state before calling us
   }
 
-  /**
-   * Start voice mode for browser transport.
-   * Mirrors MyPhoneAgent.onConnect: init pipeline with transport callbacks.
-   */
   private async startBrowserVoice(): Promise<void> {
     if (this.voiceActive) return;
     console.log('[Voice] Starting browser voice mode');
-
-    const ai = (this.env as any).AI as Ai | undefined;
-    if (!ai) {
-      this.broadcast(JSON.stringify({ type: 'voice:error', error: 'AI binding not available' }));
-      return;
-    }
-
-    // Override TTS config for browser (linear16 24kHz, not Twilio mulaw 8kHz)
-    // VoiceAgent.initVoicePipeline creates TTS internally, but we need to
-    // configure it for browser before calling. Set the env overrides.
-    // Actually — we need to configure the TTS encoding. The VoiceAgent creates
-    // TTS with default Twilio mulaw encoding. For browser we need linear16/24kHz.
-    // We'll override by setting properties before initVoicePipeline.
+    console.log('[Voice] env.AI:', this.env.AI);
+    console.log('[Voice] env.AI type:', typeof this.env.AI);
+    console.log('[Voice] env.AI.run type:', typeof this.env.AI?.run);
 
     try {
       await this.initVoicePipeline({
         onAudioChunk: (chunk: Uint8Array) => {
-          // Copy to clean ArrayBuffer to avoid byteOffset issues
           const buf = new ArrayBuffer(chunk.byteLength);
           new Uint8Array(buf).set(chunk);
           this.broadcast(buf);
         },
-
         onTTSFlushed: () => {
           this.broadcast(JSON.stringify({ type: 'voice:tts:done' }));
-          this.isSpeaking = false;
+          this.setIsSpeaking(false);
         },
-
         onBargeIn: () => {
-          // Tell browser to flush its audio playback queue
           this.broadcast(JSON.stringify({ type: 'voice:tts:clear' }));
         },
       });
@@ -206,9 +182,6 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
     console.log('[Voice] Browser voice mode active');
   }
 
-  /**
-   * Stop voice mode. Mirrors cleanup in MyPhoneAgent.cleanupAll.
-   */
   private async stopBrowserVoice(): Promise<void> {
     console.log('[Voice] Stopping browser voice mode');
     this.voiceActive = false;

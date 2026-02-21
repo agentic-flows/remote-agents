@@ -157,10 +157,10 @@ export abstract class VoiceAgent<
   /** TTS voice/speaker. Override to change voice (e.g., 'arcas' for male). */
   protected getTTSSpeaker(): string | undefined { return undefined; }
 
-  /** TTS encoding. Default 'mulaw' for Twilio. Override to 'linear16' for browser. */
+  /** TTS audio encoding. Override for browser ('linear16') vs Twilio ('mulaw'). */
   protected getTTSEncoding(): string | undefined { return undefined; }
 
-  /** TTS sample rate. Default '8000' for Twilio. Override to '24000' for browser. */
+  /** TTS sample rate. Override for browser ('24000') vs Twilio ('8000'). */
   protected getTTSSampleRate(): string | undefined { return undefined; }
 
   /** Override to return a hardcoded first response (skips LLM for lower latency). */
@@ -188,8 +188,10 @@ export abstract class VoiceAgent<
     // STT — Flux
     // Map numWordsToInterrupt → eager_eot_threshold: fewer words = lower threshold = easier barge-in.
     // Formula: 0.9 - numWords * 0.06, clamped to [0.3, 0.9]
+    // CONSTRAINT: eager_eot_threshold MUST be <= eot_threshold (default 0.7)
+    const eotThreshold = 0.7;
     const rawEagerThreshold = 0.9 - this.numWordsToInterrupt * 0.06;
-    const eagerEotThreshold = Math.max(0.3, Math.min(0.9, rawEagerThreshold));
+    const eagerEotThreshold = Math.max(0.3, Math.min(eotThreshold, rawEagerThreshold));
 
     this.stt = new CloudflareFluxSTT(
       {
@@ -197,21 +199,22 @@ export abstract class VoiceAgent<
         ...(this.sttLanguage && { language: this.sttLanguage }),
         ...(this.sttKeywords?.length && { keywords: this.sttKeywords }),
         eagerEotThreshold: Math.round(eagerEotThreshold * 100) / 100,
+        eotThreshold,
       },
       { onMessage: (response: FluxResponse) => this.handleFluxEvent(response) },
     );
 
     // TTS
     const speaker = this.getTTSSpeaker();
-    const ttsEncoding = this.getTTSEncoding();
-    const ttsSampleRate = this.getTTSSampleRate();
+    const encoding = this.getTTSEncoding();
+    const sampleRate = this.getTTSSampleRate();
     this.tts = new CloudflareAuraTTS({
       aiBinding: this.env.AI,
       accountId: this.env.CF_ACCOUNT_ID,
       apiToken: this.env.CF_API_TOKEN,
       ...(speaker && { speaker }),
-      ...(ttsEncoding && { encoding: ttsEncoding }),
-      ...(ttsSampleRate && { sampleRate: ttsSampleRate }),
+      ...(encoding && { encoding }),
+      ...(sampleRate && { sampleRate }),
     });
     this.tts.on({
       onAudioChunk: (chunk: Uint8Array) => {

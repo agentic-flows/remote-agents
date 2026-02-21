@@ -15,11 +15,11 @@
  * type conflicts with wrangler's literal types (e.g., AI_GATEWAY_NAME: "phone-agent").
  */
 export interface CoreEnv {
-  // Cloudflare AI binding (required for STT/TTS, optional for chat-only)
-  AI?: Ai;
+  // Cloudflare AI binding (required for STT/TTS)
+  AI: Ai;
   
-  // Cloudflare credentials (required for AI Gateway, optional for chat-only)
-  CF_ACCOUNT_ID?: string;
+  // Cloudflare credentials
+  CF_ACCOUNT_ID: string;
   CF_API_TOKEN?: string;
   
   // AI Gateway configuration

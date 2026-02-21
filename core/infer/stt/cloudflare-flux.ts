@@ -96,11 +96,14 @@ export class CloudflareFluxSTT {
       websocket: true
     });
 
-    console.log('STT Flux resp:', resp);
-
     const ws = (resp as unknown as { webSocket: WebSocket }).webSocket;
     if (!ws) {
-      throw new Error('Failed to establish Flux WebSocket');
+      // Read error body if available
+      let respBody = '';
+      if (resp instanceof Response) {
+        try { respBody = await (resp as Response).text(); } catch { respBody = '[could not read body]'; }
+      }
+      throw new Error(`Failed to establish Flux WebSocket. status=${(resp as any)?.status}, body=${respBody}`);
     }
 
     ws.accept();
