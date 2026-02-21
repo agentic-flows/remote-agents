@@ -157,6 +157,12 @@ export abstract class VoiceAgent<
   /** TTS voice/speaker. Override to change voice (e.g., 'arcas' for male). */
   protected getTTSSpeaker(): string | undefined { return undefined; }
 
+  /** TTS encoding. Default 'mulaw' for Twilio. Override to 'linear16' for browser. */
+  protected getTTSEncoding(): string | undefined { return undefined; }
+
+  /** TTS sample rate. Default '8000' for Twilio. Override to '24000' for browser. */
+  protected getTTSSampleRate(): string | undefined { return undefined; }
+
   /** Override to return a hardcoded first response (skips LLM for lower latency). */
   protected getFirstResponseOverride(): string | null { return null; }
 
@@ -197,11 +203,15 @@ export abstract class VoiceAgent<
 
     // TTS
     const speaker = this.getTTSSpeaker();
+    const ttsEncoding = this.getTTSEncoding();
+    const ttsSampleRate = this.getTTSSampleRate();
     this.tts = new CloudflareAuraTTS({
       aiBinding: this.env.AI,
       accountId: this.env.CF_ACCOUNT_ID,
       apiToken: this.env.CF_API_TOKEN,
       ...(speaker && { speaker }),
+      ...(ttsEncoding && { encoding: ttsEncoding }),
+      ...(ttsSampleRate && { sampleRate: ttsSampleRate }),
     });
     this.tts.on({
       onAudioChunk: (chunk: Uint8Array) => {

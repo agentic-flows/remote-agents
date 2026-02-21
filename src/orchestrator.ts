@@ -1,57 +1,48 @@
 /**
- * Orchestrator — AIChatAgent DO for managing remote coding agents.
+ * Orchestrator — Voice + Text chat agent DO for managing remote coding agents.
  *
- * You chat with the Orchestrator via WebSocket. It has tools that wrap
- * all container/sandbox operations: dispatch, kickoff, session management,
- * workspace management, exec, and lb operations.
+ * Extends VoiceAgent from core/ which provides the full voice pipeline:
+ *   - STT (Deepgram Flux) + TTS (Cloudflare Aura) lifecycle
+ *   - Flux state machine (StartOfTurn, EagerEndOfTurn, TurnResumed, EndOfTurn)
+ *   - LLM inference with streaming into TTS
+ *   - Conversation history, echo cancellation, barge-in
  *
- * Extends ChatAgent from core/ which provides:
- * - Streaming chat via WebSocket broadcast
- * - Tool calling loop via infer()
- * - Conversation history persistence in DO state
- * - @callable RPC methods (doChat, getHistory, clearHistory, ping)
+ * This class adds:
+ *   - Browser WebSocket transport (binary PCM frames, voice:start/stop control)
+ *   - Text chat via @callable doChat RPC (same tools, shared history)
+ *   - All Orchestrator tools (container lifecycle, session mgmt, workspace, lb)
  *
- * Voice support:
- * - Browser sends PCM16 16kHz mono audio as binary WebSocket frames
- * - Orchestrator runs CloudflareFluxSTT for speech-to-text
- * - Transcriptions feed into doChat() (same LLM + tools pipeline)
- * - LLM responses are synthesized via CloudflareAuraTTS
- * - TTS audio chunks are broadcast back as binary frames
- * - Control messages: voice:start, voice:stop, voice:tts:done
+ * Pattern matches MyPhoneAgent from DREAM-agents — same VoiceAgent base,
+ * different transport (browser WebSocket instead of Twilio media stream).
  */
 
 import { getSandbox } from '@cloudflare/sandbox';
 import { type Connection, callable } from 'agents';
-import { ChatAgent } from '../core/chat-agent/chat.js';
-import type { ChatInput } from '../core/chat-agent/chat.js';
+import { VoiceAgent } from '../core/voice-agent/voice.js';
+import type { VoiceAgentState } from '../core/voice-agent/voice.js';
 import type { AnyToolDefinition } from '../core/infer/tools/types.js';
-import { CloudflareFluxSTT, type FluxResponse, type FluxEventType } from '../core/infer/stt/cloudflare-flux.js';
-import { CloudflareAuraTTS } from '../core/infer/tts/cloudflare-aura.js';
-import { uint8ArrayToBase64, base64ToUint8Array } from '../core/utils/audio.js';
+import type { Message } from '../core/infer/inferutils/common.js';
+import { infer } from '../core/infer/inferutils/core.js';
 import { WORK_DIR, DEFAULT_MODEL, AGENT_PROFILES, getClient } from './config.js';
 import { setupWorkspace, saveWorkspace, restoreWorkspace, resolveWorkspaceKey } from './workspace.js';
 import { Sandbox } from './sandbox.js';
 import type { Config } from '@opencode-ai/sdk';
 
 // =============================================================================
-// ORCHESTRATOR
+// TYPES
 // =============================================================================
 
-export class Orchestrator extends ChatAgent<Env> {
-  // ---------------------------------------------------------------------------
-  // Voice state
-  // ---------------------------------------------------------------------------
-  private stt: CloudflareFluxSTT | null = null;
-  private tts: CloudflareAuraTTS | null = null;
-  private voiceActive = false;
-  private voiceProcessing = false; // true while STT→LLM→TTS pipeline is running
+interface OrchestratorState extends VoiceAgentState {
+  initialized: boolean;
+  messageCount: number;
+  lastActivity: string | null;
+}
 
-  // ---------------------------------------------------------------------------
-  // ChatAgent hooks
-  // ---------------------------------------------------------------------------
+// =============================================================================
+// SYSTEM PROMPT
+// =============================================================================
 
-  protected getSystemPrompt(_input: ChatInput): string {
-    return `You are the Orchestrator — a remote coding agent manager running on Cloudflare Workers.
+const SYSTEM_PROMPT = `You are the Orchestrator — a remote coding agent manager running on Cloudflare Workers.
 
 You manage coding agents that run inside Cloudflare Containers. Each container runs opencode serve (an AI coding agent) that can write code, run commands, create PRs, and more.
 
@@ -85,35 +76,61 @@ You have tools to:
 - Workspaces can be persisted to R2 between sessions.
 
 Be concise and helpful. Report tool results clearly. If a tool fails, explain why and suggest alternatives.`;
+
+// =============================================================================
+// ORCHESTRATOR
+// =============================================================================
+
+export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
+  // Voice is active when browser has mic open
+  private voiceActive = false;
+
+  initialState: OrchestratorState = {
+    callSid: null,
+    callerPhone: null,
+    initialized: false,
+    messageCount: 0,
+    lastActivity: null,
+  };
+
+  // ---------------------------------------------------------------------------
+  // VoiceAgent hooks
+  // ---------------------------------------------------------------------------
+
+  protected getGreeting(): string {
+    // Not used — browser transport doesn't auto-greet (unlike Twilio).
+    // Abstract method requires implementation.
+    return '';
   }
 
-  protected getModelName(): string {
-    // Use OpenAI gpt-4.1-nano via AI Gateway or direct
-    return 'openai/gpt-4.1-nano';
+  protected getSystemPrompt(): string {
+    return SYSTEM_PROMPT;
   }
 
-  protected getTools(_input: ChatInput): AnyToolDefinition[] {
+  protected override getTools(): AnyToolDefinition[] {
     return this.buildTools();
   }
 
-  protected getMaxTokens(): number {
-    return 8192;
-  }
+  // Browser needs linear16 at 24kHz (not Twilio mulaw 8kHz)
+  protected override getTTSEncoding(): string { return 'linear16'; }
+  protected override getTTSSampleRate(): string { return '24000'; }
 
   // ---------------------------------------------------------------------------
-  // Voice: WebSocket message handling
+  // Browser WebSocket transport (like MyPhoneAgent's Twilio transport)
   // ---------------------------------------------------------------------------
 
   /**
-   * Handle incoming WebSocket messages. The Agent SDK calls this for all
-   * messages. We intercept binary frames (audio) and voice control JSON,
-   * passing everything else to the parent class.
+   * Handle incoming WebSocket messages. The Agent SDK wrapper calls this
+   * after handling protocol messages (RPC, state updates).
+   *
+   * Binary frames = raw PCM16 16kHz audio from browser mic.
+   * JSON voice:start/stop = voice mode control.
    */
   async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
     // Binary frames = raw PCM audio from browser mic
     if (message instanceof ArrayBuffer) {
-      if (this.voiceActive && this.stt) {
-        this.stt.sendAudio(message);
+      if (this.voiceActive) {
+        this.sendAudioToSTT(message);
       }
       return;
     }
@@ -123,28 +140,28 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
       try {
         const data = JSON.parse(message);
         if (data.type === 'voice:start') {
-          await this.startVoice();
+          await this.startBrowserVoice();
           return;
         }
         if (data.type === 'voice:stop') {
-          await this.stopVoice();
+          await this.stopBrowserVoice();
           return;
         }
       } catch {
-        // Not JSON or not a voice message — fall through to parent
+        // Not JSON or not a voice message — fall through
       }
     }
 
-    // Everything else (RPC, state updates, etc.) handled by Agent SDK
-    // The parent class processes these automatically via the SDK's internal routing
+    // Everything else: SDK already handled RPC/state before calling us
   }
 
   /**
-   * Start voice mode: connect STT + TTS, begin listening.
+   * Start voice mode for browser transport.
+   * Mirrors MyPhoneAgent.onConnect: init pipeline with transport callbacks.
    */
-  private async startVoice(): Promise<void> {
+  private async startBrowserVoice(): Promise<void> {
     if (this.voiceActive) return;
-    this.log('Voice: starting');
+    console.log('[Voice] Starting browser voice mode');
 
     const ai = (this.env as any).AI as Ai | undefined;
     if (!ai) {
@@ -152,154 +169,149 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
       return;
     }
 
-    // Initialize TTS (linear16, 24kHz for browser playback)
-    this.tts = new CloudflareAuraTTS({
-      aiBinding: ai,
-      encoding: 'linear16',
-      sampleRate: '24000',
-      speaker: 'asteria',
-    });
-
-    this.tts.on({
-      onAudioChunk: (chunk: Uint8Array) => {
-        // Copy to a clean ArrayBuffer to avoid byteOffset issues
-        const buf = new ArrayBuffer(chunk.byteLength);
-        new Uint8Array(buf).set(chunk);
-        this.broadcast(buf);
-      },
-      onFlushed: () => {
-        this.broadcast(JSON.stringify({ type: 'voice:tts:done' }));
-        this.voiceProcessing = false;
-      },
-    });
-
-    // Pre-connect TTS so first response is fast
-    try {
-      await this.tts.preconnect();
-    } catch (e) {
-      this.log(`Voice: TTS preconnect failed: ${e}`, 'warn');
-    }
-
-    // Initialize STT (Flux — 16kHz linear16 input)
-    this.stt = new CloudflareFluxSTT(
-      {
-        aiBinding: ai,
-        eotTimeoutMs: 5000,
-        eagerEotThreshold: 0.5,
-        eotThreshold: 0.7,
-      },
-      {
-        onMessage: (response: FluxResponse) => {
-          this.handleFluxEvent(response);
-        },
-        onClose: () => {
-          this.log('Voice: STT closed');
-          if (this.voiceActive) {
-            // Reconnect if still active
-            this.stt?.connect().catch((e) => this.log(`Voice: STT reconnect failed: ${e}`, 'error'));
-          }
-        },
-        onError: (error: Error) => {
-          this.log(`Voice: STT error: ${error.message}`, 'error');
-        },
-      },
-    );
+    // Override TTS config for browser (linear16 24kHz, not Twilio mulaw 8kHz)
+    // VoiceAgent.initVoicePipeline creates TTS internally, but we need to
+    // configure it for browser before calling. Set the env overrides.
+    // Actually — we need to configure the TTS encoding. The VoiceAgent creates
+    // TTS with default Twilio mulaw encoding. For browser we need linear16/24kHz.
+    // We'll override by setting properties before initVoicePipeline.
 
     try {
-      await this.stt.connect();
+      await this.initVoicePipeline({
+        onAudioChunk: (chunk: Uint8Array) => {
+          // Copy to clean ArrayBuffer to avoid byteOffset issues
+          const buf = new ArrayBuffer(chunk.byteLength);
+          new Uint8Array(buf).set(chunk);
+          this.broadcast(buf);
+        },
+
+        onTTSFlushed: () => {
+          this.broadcast(JSON.stringify({ type: 'voice:tts:done' }));
+          this.isSpeaking = false;
+        },
+
+        onBargeIn: () => {
+          // Tell browser to flush its audio playback queue
+          this.broadcast(JSON.stringify({ type: 'voice:tts:clear' }));
+        },
+      });
     } catch (e) {
-      this.broadcast(JSON.stringify({ type: 'voice:error', error: `STT connection failed: ${e}` }));
+      console.error('[Voice] Pipeline init failed:', e);
+      this.broadcast(JSON.stringify({ type: 'voice:error', error: `Voice init failed: ${e}` }));
       return;
     }
 
     this.voiceActive = true;
     this.broadcast(JSON.stringify({ type: 'voice:started' }));
-    this.log('Voice: active');
+    console.log('[Voice] Browser voice mode active');
   }
 
   /**
-   * Stop voice mode: disconnect STT + TTS, clean up.
+   * Stop voice mode. Mirrors cleanup in MyPhoneAgent.cleanupAll.
    */
-  private async stopVoice(): Promise<void> {
-    this.log('Voice: stopping');
+  private async stopBrowserVoice(): Promise<void> {
+    console.log('[Voice] Stopping browser voice mode');
     this.voiceActive = false;
-
-    if (this.stt) {
-      this.stt.close();
-      this.stt = null;
-    }
-
-    if (this.tts) {
-      this.tts.clear();
-      this.tts.close();
-      this.tts = null;
-    }
-
-    this.voiceProcessing = false;
+    this.cleanupVoicePipeline();
     this.broadcast(JSON.stringify({ type: 'voice:stopped' }));
-    this.log('Voice: stopped');
   }
 
-  /**
-   * Handle Flux STT events. On EndOfTurn, take the final transcript and
-   * run it through the same doChat() pipeline as text messages.
-   */
-  private handleFluxEvent(response: FluxResponse): void {
-    const event = response.event as FluxEventType;
+  // ---------------------------------------------------------------------------
+  // Text chat — @callable RPC (lifted from ChatAgent)
+  // ---------------------------------------------------------------------------
 
-    // Broadcast interim transcripts for UI display
-    if (event === 'Update' || event === 'EndOfTurn' || event === 'EagerEndOfTurn') {
-      this.broadcast(JSON.stringify({
-        type: 'voice:transcript',
-        text: response.transcript,
-        isFinal: event === 'EndOfTurn',
-        event,
+  @callable({ description: 'Send a chat message (streaming via WebSocket broadcast)' })
+  async doChat(input: { message: string }): Promise<{ id: string; role: 'assistant'; content: string; timestamp: string }> {
+    const message = typeof input === 'string' ? (input as any) : input.message;
+    const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    // Build messages from shared history (voice + text share the same history)
+    const systemMsg: Message = { role: 'system', content: SYSTEM_PROMPT };
+    this.history.push({ role: 'user', content: message });
+
+    // Truncate to avoid message limits (keep last 80)
+    if (this.history.length > 80) {
+      this.history = this.history.slice(-80);
+    }
+
+    const messages: Message[] = [systemMsg, ...this.history];
+
+    // Broadcast stream start
+    this.broadcast(JSON.stringify({ type: 'chat:stream:start', id: msgId }));
+
+    const tools = this.buildTools();
+
+    const result = await infer({
+      env: this.env,
+      metadata: { agentId: 'orchestrator', userId: 'chat-user' },
+      actionKey: 'testModelConfig',
+      messages,
+      modelName: 'openai/gpt-4.1-nano',
+      tools,
+      maxTokens: 8192,
+      temperature: 0.3,
+      stream: {
+        chunk_size: 1,
+        onChunk: (chunk: string) => {
+          this.broadcast(JSON.stringify({ type: 'chat:stream:chunk', id: msgId, content: chunk }));
+        },
+      },
+    });
+
+    const assistantContent = result.string || '';
+
+    // Broadcast stream end
+    this.broadcast(JSON.stringify({ type: 'chat:stream:end', id: msgId, content: assistantContent }));
+
+    // Update shared history
+    if (result.toolCallContext?.messages) {
+      for (const msg of result.toolCallContext.messages) {
+        this.history.push(msg);
+      }
+    }
+    this.history.push({ role: 'assistant', content: assistantContent });
+
+    // Cap history
+    if (this.history.length > 80) {
+      this.history = this.history.slice(-80);
+    }
+
+    this.setState({
+      ...this.state,
+      messageCount: (this.state.messageCount || 0) + 1,
+      lastActivity: new Date().toISOString(),
+    });
+
+    return { id: msgId, role: 'assistant', content: assistantContent, timestamp: new Date().toISOString() };
+  }
+
+  @callable({ description: 'Get conversation history' })
+  getHistory() {
+    return this.history
+      .filter(m => m.role === 'user' || m.role === 'assistant')
+      .map((m, i) => ({
+        id: `msg_${i}`,
+        role: m.role,
+        content: typeof m.content === 'string' ? m.content : JSON.stringify(m.content),
+        timestamp: this.state.lastActivity || new Date().toISOString(),
       }));
-    }
-
-    // On barge-in: cancel any in-progress TTS
-    if (event === 'StartOfTurn') {
-      if (this.voiceProcessing && this.tts) {
-        this.tts.clear();
-        this.voiceProcessing = false;
-      }
-    }
-
-    // On final turn: send transcript through LLM pipeline
-    if (event === 'EndOfTurn' && response.transcript.trim()) {
-      this.processVoiceTranscript(response.transcript.trim());
-    }
   }
 
-  /**
-   * Take a finalized transcript and run it through the LLM pipeline.
-   * The response text is sent to TTS for audio synthesis.
-   */
-  private async processVoiceTranscript(text: string): Promise<void> {
-    if (this.voiceProcessing) {
-      this.log('Voice: already processing, skipping');
-      return;
-    }
-    this.voiceProcessing = true;
-    this.log(`Voice: processing transcript: "${text.slice(0, 80)}"`);
+  @callable({ description: 'Clear conversation history' })
+  clearHistory() {
+    this.history = [];
+    this.setState({ ...this.state, messageCount: 0 });
+    return { cleared: true };
+  }
 
-    try {
-      // Use the same doChat pipeline as text messages
-      const result = await this.doChat({ message: text });
-
-      // Send the LLM response to TTS
-      if (result.content && this.tts && this.voiceActive) {
-        this.tts.speak(result.content);
-        this.tts.flush();
-        // voiceProcessing will be set to false when TTS onFlushed fires
-      } else {
-        this.voiceProcessing = false;
-      }
-    } catch (e) {
-      this.log(`Voice: LLM error: ${e}`, 'error');
-      this.voiceProcessing = false;
-      this.broadcast(JSON.stringify({ type: 'voice:error', error: `LLM processing failed: ${e}` }));
-    }
+  @callable({ description: 'Health check' })
+  ping() {
+    return {
+      ok: true,
+      messageCount: this.state.messageCount || 0,
+      voiceActive: this.voiceActive,
+      timestamp: new Date().toISOString(),
+    };
   }
 
   // ---------------------------------------------------------------------------
@@ -337,16 +349,13 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
           const issueId = args.issueId.toUpperCase();
           const branch = `${issueId}-remote`;
 
-          // Resolve profile
           const profile = args.profile ? AGENT_PROFILES[args.profile] : undefined;
           if (args.profile && !profile) {
             return { error: `Unknown profile "${args.profile}". Available: ${Object.keys(AGENT_PROFILES).join(', ')}` };
           }
 
-          // Setup workspace
           await setupWorkspace(sandbox, env, { repo: args.repo, branch, setupLb: true });
 
-          // Read issue
           const issueResult = await sandbox.exec(
             `cd ${WORK_DIR} && LINEAR_API_KEY=${env.LINEAR_API_KEY} lb show ${issueId} 2>&1`,
           );
@@ -355,24 +364,20 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
             return { error: `Issue ${issueId} not found`, raw: issueDescription };
           }
 
-          // Claim it
           await sandbox.exec(
             `cd ${WORK_DIR} && LINEAR_API_KEY=${env.LINEAR_API_KEY} lb update ${issueId} --status in_progress 2>&1 || true`,
           );
 
-          // Start opencode + create session
           const mergedMcp = { ...profile?.mcp };
           const { client } = await getClient(sandbox, env, mergedMcp);
           const session = await client.session.create({ title: `${issueId} — Remote Agent`, directory: WORK_DIR });
           if (!session.data) throw new Error(`Failed to create session: ${JSON.stringify(session)}`);
 
-          // Build prompt
           const prompt = buildDispatchPrompt(issueId, branch, issueDescription, env);
           const model = profile?.model || DEFAULT_MODEL;
           const systemPrompt = profile?.system;
           const fullPrompt = systemPrompt ? `${systemPrompt}\n\n---\n\n${prompt}` : prompt;
 
-          // Fire async
           await client.session.promptAsync({
             sessionID: session.data.id,
             directory: WORK_DIR,
@@ -380,7 +385,6 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
             parts: [{ type: 'text', text: fullPrompt }],
           });
 
-          // Log session
           await (sandbox as unknown as Sandbox).logSession({
             sessionId: session.data.id,
             issueId,
@@ -502,7 +506,6 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
             const sessionBusy = statusData[args.sessionId]?.type === 'busy';
             const liveMessages = messages.data ?? [];
 
-            // Snapshot if idle
             if (!sessionBusy && liveMessages.length > 0) {
               try {
                 await (sandbox as unknown as Sandbox).saveMessages(args.sessionId, liveMessages);
@@ -510,7 +513,6 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
               } catch { /* non-fatal */ }
             }
 
-            // Return last few messages for context
             const recentMessages = liveMessages.slice(-5).map((m: any) => ({
               role: m.role ?? m.type ?? 'unknown',
               content: typeof m.content === 'string' ? m.content?.slice(0, 500) :
@@ -525,7 +527,6 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
               recentMessages,
             };
           } catch {
-            // Container dead — check persisted
             try {
               const log = await (sandbox as unknown as Sandbox).getSessionLog(args.sessionId);
               const saved = await (sandbox as unknown as Sandbox).getSessionMessages(args.sessionId);

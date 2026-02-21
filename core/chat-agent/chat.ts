@@ -111,6 +111,11 @@ export abstract class ChatAgent<
     return 0.3;
   }
 
+  /** Max history messages to send to the LLM (to avoid token/message limits). */
+  protected getMaxHistoryMessages(): number {
+    return 80; // Leave room for system prompt + tool call expansion
+  }
+
   /** Called before sending to LLM. Override for pre-processing (e.g., injecting context). */
   protected async onBeforeInfer(_input: ChatInput, messages: Message[]): Promise<Message[]> {
     return messages;
@@ -142,7 +147,14 @@ export abstract class ChatAgent<
     const tools = this.getTools(input);
 
     const systemMsg: Message = { role: 'system', content: systemPrompt };
-    let messages: Message[] = [systemMsg, ...history];
+
+    // Truncate history to avoid message limit errors (keep most recent messages)
+    const maxHistory = this.getMaxHistoryMessages();
+    const trimmedHistory = history.length > maxHistory
+      ? history.slice(-maxHistory)
+      : history;
+
+    let messages: Message[] = [systemMsg, ...trimmedHistory];
 
     // Broadcast stream start so client can show typing indicator
     this.broadcast(JSON.stringify({
