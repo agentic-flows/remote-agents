@@ -10,12 +10,24 @@
  * - Tool calling loop via infer()
  * - Conversation history persistence in DO state
  * - @callable RPC methods (doChat, getHistory, clearHistory, ping)
+ *
+ * Voice support:
+ * - Browser sends PCM16 16kHz mono audio as binary WebSocket frames
+ * - Orchestrator runs CloudflareFluxSTT for speech-to-text
+ * - Transcriptions feed into doChat() (same LLM + tools pipeline)
+ * - LLM responses are synthesized via CloudflareAuraTTS
+ * - TTS audio chunks are broadcast back as binary frames
+ * - Control messages: voice:start, voice:stop, voice:tts:done
  */
 
 import { getSandbox } from '@cloudflare/sandbox';
+import { type Connection, callable } from 'agents';
 import { ChatAgent } from '../core/chat-agent/chat.js';
 import type { ChatInput } from '../core/chat-agent/chat.js';
 import type { AnyToolDefinition } from '../core/infer/tools/types.js';
+import { CloudflareFluxSTT, type FluxResponse, type FluxEventType } from '../core/infer/stt/cloudflare-flux.js';
+import { CloudflareAuraTTS } from '../core/infer/tts/cloudflare-aura.js';
+import { uint8ArrayToBase64, base64ToUint8Array } from '../core/utils/audio.js';
 import { WORK_DIR, DEFAULT_MODEL, AGENT_PROFILES, getClient } from './config.js';
 import { setupWorkspace, saveWorkspace, restoreWorkspace, resolveWorkspaceKey } from './workspace.js';
 import { Sandbox } from './sandbox.js';
@@ -26,6 +38,14 @@ import type { Config } from '@opencode-ai/sdk';
 // =============================================================================
 
 export class Orchestrator extends ChatAgent<Env> {
+  // ---------------------------------------------------------------------------
+  // Voice state
+  // ---------------------------------------------------------------------------
+  private stt: CloudflareFluxSTT | null = null;
+  private tts: CloudflareAuraTTS | null = null;
+  private voiceActive = false;
+  private voiceProcessing = false; // true while STT→LLM→TTS pipeline is running
+
   // ---------------------------------------------------------------------------
   // ChatAgent hooks
   // ---------------------------------------------------------------------------
@@ -78,6 +98,208 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
 
   protected getMaxTokens(): number {
     return 8192;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Voice: WebSocket message handling
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Handle incoming WebSocket messages. The Agent SDK calls this for all
+   * messages. We intercept binary frames (audio) and voice control JSON,
+   * passing everything else to the parent class.
+   */
+  async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
+    // Binary frames = raw PCM audio from browser mic
+    if (message instanceof ArrayBuffer) {
+      if (this.voiceActive && this.stt) {
+        this.stt.sendAudio(message);
+      }
+      return;
+    }
+
+    // Try parsing as voice control message
+    if (typeof message === 'string') {
+      try {
+        const data = JSON.parse(message);
+        if (data.type === 'voice:start') {
+          await this.startVoice();
+          return;
+        }
+        if (data.type === 'voice:stop') {
+          await this.stopVoice();
+          return;
+        }
+      } catch {
+        // Not JSON or not a voice message — fall through to parent
+      }
+    }
+
+    // Everything else (RPC, state updates, etc.) handled by Agent SDK
+    // The parent class processes these automatically via the SDK's internal routing
+  }
+
+  /**
+   * Start voice mode: connect STT + TTS, begin listening.
+   */
+  private async startVoice(): Promise<void> {
+    if (this.voiceActive) return;
+    this.log('Voice: starting');
+
+    const ai = (this.env as any).AI as Ai | undefined;
+    if (!ai) {
+      this.broadcast(JSON.stringify({ type: 'voice:error', error: 'AI binding not available' }));
+      return;
+    }
+
+    // Initialize TTS (linear16, 24kHz for browser playback)
+    this.tts = new CloudflareAuraTTS({
+      aiBinding: ai,
+      encoding: 'linear16',
+      sampleRate: '24000',
+      speaker: 'asteria',
+    });
+
+    this.tts.on({
+      onAudioChunk: (chunk: Uint8Array) => {
+        // Copy to a clean ArrayBuffer to avoid byteOffset issues
+        const buf = new ArrayBuffer(chunk.byteLength);
+        new Uint8Array(buf).set(chunk);
+        this.broadcast(buf);
+      },
+      onFlushed: () => {
+        this.broadcast(JSON.stringify({ type: 'voice:tts:done' }));
+        this.voiceProcessing = false;
+      },
+    });
+
+    // Pre-connect TTS so first response is fast
+    try {
+      await this.tts.preconnect();
+    } catch (e) {
+      this.log(`Voice: TTS preconnect failed: ${e}`, 'warn');
+    }
+
+    // Initialize STT (Flux — 16kHz linear16 input)
+    this.stt = new CloudflareFluxSTT(
+      {
+        aiBinding: ai,
+        eotTimeoutMs: 5000,
+        eagerEotThreshold: 0.5,
+        eotThreshold: 0.7,
+      },
+      {
+        onMessage: (response: FluxResponse) => {
+          this.handleFluxEvent(response);
+        },
+        onClose: () => {
+          this.log('Voice: STT closed');
+          if (this.voiceActive) {
+            // Reconnect if still active
+            this.stt?.connect().catch((e) => this.log(`Voice: STT reconnect failed: ${e}`, 'error'));
+          }
+        },
+        onError: (error: Error) => {
+          this.log(`Voice: STT error: ${error.message}`, 'error');
+        },
+      },
+    );
+
+    try {
+      await this.stt.connect();
+    } catch (e) {
+      this.broadcast(JSON.stringify({ type: 'voice:error', error: `STT connection failed: ${e}` }));
+      return;
+    }
+
+    this.voiceActive = true;
+    this.broadcast(JSON.stringify({ type: 'voice:started' }));
+    this.log('Voice: active');
+  }
+
+  /**
+   * Stop voice mode: disconnect STT + TTS, clean up.
+   */
+  private async stopVoice(): Promise<void> {
+    this.log('Voice: stopping');
+    this.voiceActive = false;
+
+    if (this.stt) {
+      this.stt.close();
+      this.stt = null;
+    }
+
+    if (this.tts) {
+      this.tts.clear();
+      this.tts.close();
+      this.tts = null;
+    }
+
+    this.voiceProcessing = false;
+    this.broadcast(JSON.stringify({ type: 'voice:stopped' }));
+    this.log('Voice: stopped');
+  }
+
+  /**
+   * Handle Flux STT events. On EndOfTurn, take the final transcript and
+   * run it through the same doChat() pipeline as text messages.
+   */
+  private handleFluxEvent(response: FluxResponse): void {
+    const event = response.event as FluxEventType;
+
+    // Broadcast interim transcripts for UI display
+    if (event === 'Update' || event === 'EndOfTurn' || event === 'EagerEndOfTurn') {
+      this.broadcast(JSON.stringify({
+        type: 'voice:transcript',
+        text: response.transcript,
+        isFinal: event === 'EndOfTurn',
+        event,
+      }));
+    }
+
+    // On barge-in: cancel any in-progress TTS
+    if (event === 'StartOfTurn') {
+      if (this.voiceProcessing && this.tts) {
+        this.tts.clear();
+        this.voiceProcessing = false;
+      }
+    }
+
+    // On final turn: send transcript through LLM pipeline
+    if (event === 'EndOfTurn' && response.transcript.trim()) {
+      this.processVoiceTranscript(response.transcript.trim());
+    }
+  }
+
+  /**
+   * Take a finalized transcript and run it through the LLM pipeline.
+   * The response text is sent to TTS for audio synthesis.
+   */
+  private async processVoiceTranscript(text: string): Promise<void> {
+    if (this.voiceProcessing) {
+      this.log('Voice: already processing, skipping');
+      return;
+    }
+    this.voiceProcessing = true;
+    this.log(`Voice: processing transcript: "${text.slice(0, 80)}"`);
+
+    try {
+      // Use the same doChat pipeline as text messages
+      const result = await this.doChat({ message: text });
+
+      // Send the LLM response to TTS
+      if (result.content && this.tts && this.voiceActive) {
+        this.tts.speak(result.content);
+        this.tts.flush();
+        // voiceProcessing will be set to false when TTS onFlushed fires
+      } else {
+        this.voiceProcessing = false;
+      }
+    } catch (e) {
+      this.log(`Voice: LLM error: ${e}`, 'error');
+      this.voiceProcessing = false;
+      this.broadcast(JSON.stringify({ type: 'voice:error', error: `LLM processing failed: ${e}` }));
+    }
   }
 
   // ---------------------------------------------------------------------------
