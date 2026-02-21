@@ -11,6 +11,7 @@
  * 6. Prompt    — POST /api/session/:id/prompt   → send follow-up (async)
  * 7. Exec      — POST /api/exec                 → run command in container (debug)
  * 8. Sessions  — GET  /api/sessions             → list all sessions
+ * 9. Profiles  — GET  /api/profiles             → list available agent profiles
  *
  * Based on the sandbox-sdk opencode-remote reference example.
  *
@@ -190,6 +191,96 @@ const DEFAULT_MODEL = {
 // but TypeScript resolves the v1 types from the package root. We use `any`
 // for the client to avoid type mismatches.
 type SdkClient = any;
+
+// ---------------------------------------------------------------------------
+// Agent Profiles — named bundles of model + system prompt + MCP servers.
+// Select via `"profile": "researcher"` in dispatch/kickoff request body.
+// Profile settings are defaults that can be overridden by explicit params.
+// ---------------------------------------------------------------------------
+interface AgentProfile {
+  model: { providerID: string; modelID: string };
+  system?: string;
+  mcp?: Config['mcp'];
+}
+
+const AGENT_PROFILES: Record<string, AgentProfile> = {
+  // Default coder — no special system prompt, relies on AGENTS.md from repo
+  coder: {
+    model: { providerID: 'opencode', modelID: 'big-pickle' },
+  },
+
+  // Research agent — optimized for web research, summarization, and analysis
+  researcher: {
+    model: { providerID: 'opencode', modelID: 'big-pickle' },
+    system: `You are a research agent. Your primary job is to gather information, analyze it, and produce well-structured research reports.
+
+## Tools & Approach
+
+- Use web search and fetch tools aggressively to gather information from multiple sources.
+- Cross-reference claims across sources. Note disagreements or uncertainty.
+- Cite your sources with URLs.
+- Structure your output with clear sections, headings, and bullet points.
+- When writing files, use markdown format with proper frontmatter.
+
+## Output
+
+Always save your research to files in the workspace:
+- Main report: \`research.md\` or \`<topic>.md\`
+- Raw notes: \`notes/\` directory for supporting material
+- Data: \`data/\` directory for any structured data (JSON, CSV)
+
+When done, commit and push all files to preserve your work.`,
+    mcp: {
+      // Researcher gets all default MCP servers plus any extras
+    },
+  },
+
+  // Refiner agent — reads issues and adds implementation details
+  refiner: {
+    model: { providerID: 'opencode', modelID: 'big-pickle' },
+    system: `You are an issue refinement agent. Your job is to take rough issue descriptions and add detailed implementation plans.
+
+## Process
+
+1. Read the issue description carefully.
+2. Explore the codebase to understand the architecture and patterns.
+3. Add to the issue description:
+   - Technical approach with specific files to modify
+   - Step-by-step implementation plan
+   - Acceptance criteria (testable, specific)
+   - Dependencies and risks
+   - Estimated complexity
+
+## Style
+
+- Be specific: name files, functions, line numbers.
+- Be practical: focus on what to change, not theory.
+- Be thorough: cover edge cases and error handling.
+- Keep it concise: developers will read this while coding.`,
+  },
+
+  // Reviewer agent — reviews PRs and code
+  reviewer: {
+    model: { providerID: 'opencode', modelID: 'big-pickle' },
+    system: `You are a code review agent. Your job is to review code changes and provide actionable feedback.
+
+## Process
+
+1. Read the PR diff or code changes.
+2. Check for: bugs, security issues, performance problems, missing error handling, style inconsistencies.
+3. Verify the implementation matches the issue requirements.
+4. Check that tests cover the changes.
+
+## Output
+
+Provide feedback as:
+- **Critical**: Must fix before merge (bugs, security, data loss)
+- **Important**: Should fix (error handling, performance, maintainability)
+- **Suggestion**: Nice to have (style, naming, documentation)
+
+Be specific: reference file paths and line numbers. Suggest fixes, don't just point out problems.`,
+  },
+};
 
 // MCP servers available to all remote agents by default.
 // Additional servers can be added per-request via the `mcp` body param.
@@ -409,6 +500,22 @@ export default {
       return handleSnapshot(sandbox, env, snapshotMatch[1]);
     }
 
+    // GET /api/profiles — list available agent profiles
+    if (request.method === 'GET' && url.pathname === '/api/profiles') {
+      const profiles = Object.fromEntries(
+        Object.entries(AGENT_PROFILES).map(([name, p]) => [
+          name,
+          {
+            model: p.model,
+            hasSystemPrompt: !!p.system,
+            systemPromptPreview: p.system?.slice(0, 200) ?? null,
+            hasMcp: !!p.mcp && Object.keys(p.mcp).length > 0,
+          },
+        ]),
+      );
+      return Response.json({ profiles });
+    }
+
     // Everything else: proxy to the opencode web UI
     const server = await createOpencodeServer(sandbox, {
       directory: WORK_DIR,
@@ -424,7 +531,9 @@ export default {
 //
 // Body: { "issueId": "AGE-42", "repo"?: "...",
 //         "model"?: { "providerID": "...", "modelID": "..." },
-//         "mcp"?: { "name": { type: "local", command: [...] } } }
+//         "mcp"?: { "name": { type: "local", command: [...] } },
+//         "system"?: "custom system prompt",
+//         "profile"?: "researcher" | "coder" | "refiner" | "reviewer" }
 //
 // This is the main integration point with lb/Linear:
 // 1. Clones the repo
@@ -446,6 +555,8 @@ async function handleDispatch(
       repo?: string;
       model?: { providerID: string; modelID: string };
       mcp?: Config['mcp'];
+      system?: string;
+      profile?: string;
     };
     if (!body.issueId) {
       return Response.json({ error: 'Missing "issueId" in request body' }, { status: 400 });
@@ -457,6 +568,15 @@ async function handleDispatch(
       return Response.json(
         { error: 'LINEAR_API_KEY not configured — lb cannot sync with Linear' },
         { status: 500 },
+      );
+    }
+
+    // Resolve profile (if specified) — profile provides defaults for model, system, mcp
+    const profile = body.profile ? AGENT_PROFILES[body.profile] : undefined;
+    if (body.profile && !profile) {
+      return Response.json(
+        { error: `Unknown profile "${body.profile}". Available: ${Object.keys(AGENT_PROFILES).join(', ')}` },
+        { status: 400 },
       );
     }
 
@@ -487,8 +607,11 @@ async function handleDispatch(
       `cd ${WORK_DIR} && LINEAR_API_KEY=${env.LINEAR_API_KEY} lb update ${issueId} --status in_progress 2>&1 || true`,
     );
 
+    // Merge MCP: profile MCP (defaults) + body MCP (overrides)
+    const mergedMcp = { ...profile?.mcp, ...body.mcp };
+
     // Start opencode serve + get SDK client (with MCP servers)
-    const { client } = await getClient(sandbox, env, body.mcp);
+    const { client } = await getClient(sandbox, env, mergedMcp);
 
     // Create session
     const session = await client.session.create({
@@ -502,20 +625,30 @@ async function handleDispatch(
     // Build the agent prompt
     const prompt = buildDispatchPrompt(issueId, branch, issueDescription, env);
 
+    // Resolve model: explicit > profile > default
+    const model = body.model || profile?.model || DEFAULT_MODEL;
+
+    // Resolve system prompt: explicit > profile > none
+    // System prompt is prepended to the dispatch prompt so the agent
+    // gets both its role context and the issue-specific instructions.
+    const systemPrompt = body.system || profile?.system;
+    const fullPrompt = systemPrompt
+      ? `${systemPrompt}\n\n---\n\n${prompt}`
+      : prompt;
+
     // Fire prompt async
-    const model = body.model || DEFAULT_MODEL;
     await client.session.promptAsync({
       sessionID: session.data.id,
       directory: WORK_DIR,
       model,
-      parts: [{ type: 'text', text: prompt }],
+      parts: [{ type: 'text', text: fullPrompt }],
     });
 
     // Persist session log to DO SQLite (survives container hibernation)
     await (sandbox as Sandbox).logSession({
       sessionId: session.data.id,
       issueId,
-      prompt,
+      prompt: fullPrompt,
       model,
       repo: body.repo,
       branch,
@@ -527,6 +660,7 @@ async function handleDispatch(
       branch,
       status: 'dispatched',
       model,
+      profile: body.profile ?? null,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -582,7 +716,8 @@ ${issueDescription}
 // ===========================================================================
 // POST /api/kickoff — raw prompt
 // Body: { "text": "...", "repo"?: "...", "project"?: "...", "branch"?: "...",
-//         "model"?: { "providerID": "...", "modelID": "..." } }
+//         "model"?: { "providerID": "...", "modelID": "..." },
+//         "mcp"?: { ... }, "system"?: "...", "profile"?: "researcher" }
 //
 // Three workspace modes:
 //   1. "repo": "https://..." — clone existing repo
@@ -602,9 +737,20 @@ async function handleKickoff(
       branch?: string;
       model?: { providerID: string; modelID: string };
       mcp?: Config['mcp'];
+      system?: string;
+      profile?: string;
     };
     if (!body.text) {
       return Response.json({ error: 'Missing "text" in request body' }, { status: 400 });
+    }
+
+    // Resolve profile
+    const profile = body.profile ? AGENT_PROFILES[body.profile] : undefined;
+    if (body.profile && !profile) {
+      return Response.json(
+        { error: `Unknown profile "${body.profile}". Available: ${Object.keys(AGENT_PROFILES).join(', ')}` },
+        { status: 400 },
+      );
     }
 
     const repoUrl = await setupWorkspace(sandbox, env, {
@@ -614,7 +760,10 @@ async function handleKickoff(
       setupLb: false,
     });
 
-    const { client } = await getClient(sandbox, env, body.mcp);
+    // Merge MCP: profile MCP (defaults) + body MCP (overrides)
+    const mergedMcp = { ...profile?.mcp, ...body.mcp };
+
+    const { client } = await getClient(sandbox, env, mergedMcp);
 
     const session = await client.session.create({
       title: body.project ? `Project: ${body.project}` : 'Remote Agent',
@@ -624,24 +773,32 @@ async function handleKickoff(
       throw new Error(`Failed to create session: ${JSON.stringify(session)}`);
     }
 
-    // If there's a repo (existing or newly created), tell the agent to persist work
+    // Build the prompt with persistence instructions and system prompt
     let promptText = body.text;
     if (repoUrl) {
       promptText += `\n\n## Persistence\n\nYour workspace is backed by a GitHub repo: ${repoUrl}\nWhen you are done, commit all your work and push it so nothing is lost.\nUse: \`git add -A && git commit -m "description" && git push\`\nIf pushing fails with auth errors, use: \`git push https://\${GH_TOKEN}@github.com/... HEAD:refs/heads/main\``;
     }
 
-    const model = body.model || DEFAULT_MODEL;
+    // Resolve system prompt: explicit > profile > none
+    const systemPrompt = body.system || profile?.system;
+    const fullPrompt = systemPrompt
+      ? `${systemPrompt}\n\n---\n\n${promptText}`
+      : promptText;
+
+    // Resolve model: explicit > profile > default
+    const model = body.model || profile?.model || DEFAULT_MODEL;
+
     await client.session.promptAsync({
       sessionID: session.data.id,
       directory: WORK_DIR,
       model,
-      parts: [{ type: 'text', text: promptText }],
+      parts: [{ type: 'text', text: fullPrompt }],
     });
 
     // Persist session log to DO SQLite (survives container hibernation)
     await (sandbox as Sandbox).logSession({
       sessionId: session.data.id,
-      prompt: promptText,
+      prompt: fullPrompt,
       model,
       repo: repoUrl ?? undefined,
     });
@@ -651,6 +808,7 @@ async function handleKickoff(
       status: 'kicked off',
       model,
       repo: repoUrl,
+      profile: body.profile ?? null,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -785,7 +943,7 @@ async function handleSessionStatus(
 
 // ===========================================================================
 // POST /api/session/:id/prompt — send follow-up (async)
-// Body: { "text": "..." }
+// Body: { "text": "...", "model"?: { ... } }
 // ===========================================================================
 async function handleFollowUp(
   sandbox: ReturnType<typeof getSandbox>,
@@ -794,7 +952,10 @@ async function handleFollowUp(
   request: Request,
 ): Promise<Response> {
   try {
-    const body = (await request.json()) as { text?: string };
+    const body = (await request.json()) as {
+      text?: string;
+      model?: { providerID: string; modelID: string };
+    };
     if (!body.text) {
       return Response.json({ error: 'Missing "text"' }, { status: 400 });
     }
@@ -803,7 +964,7 @@ async function handleFollowUp(
     await client.session.promptAsync({
       sessionID: sessionId,
       directory: WORK_DIR,
-      model: DEFAULT_MODEL,
+      model: body.model || DEFAULT_MODEL,
       parts: [{ type: 'text', text: body.text }],
     });
 
