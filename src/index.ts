@@ -398,9 +398,15 @@ async function setupWorkspace(
     }
   } else if (opts.workspace) {
     // Named workspace — try to restore from R2 first
-    const restored = await restoreWorkspace(sandbox, env, `named/${opts.workspace}`);
+    let restored = false;
+    try {
+      restored = await restoreWorkspace(sandbox, env, `named/${opts.workspace}`);
+    } catch (e) {
+      // Log but don't fail — fall through to fresh workspace
+      console.error('Workspace restore failed:', e);
+    }
     if (!restored) {
-      // No existing snapshot — create fresh workspace
+      // No existing snapshot or restore failed — create fresh workspace
       await sandbox.exec(`mkdir -p ${WORK_DIR}`);
       await sandbox.exec(`cd ${WORK_DIR} && git init -b main`);
     }
@@ -486,8 +492,10 @@ const WORKSPACE_EXCLUDES = [
 
 /**
  * Save the current workspace to R2 as a compressed tar archive.
- * Uses readFileStream for binary transfer (sandbox readFile is string-only).
- * Returns the R2 key used.
+ *
+ * Strategy: tar + gzip + base64-encode inside the container, then read the
+ * base64 text via exec (ASCII-safe, avoids readFileStream's structured
+ * envelope format). Decode from base64 in the Worker before uploading to R2.
  */
 async function saveWorkspace(
   sandbox: ReturnType<typeof getSandbox>,
@@ -496,25 +504,62 @@ async function saveWorkspace(
 ): Promise<{ key: string; size: number }> {
   const r2Key = `workspaces/${key}.tar.gz`;
   const archivePath = '/tmp/workspace-snapshot.tar.gz';
+  const b64Path = '/tmp/workspace-snapshot.b64';
 
   // Create compressed archive (excluding heavy dirs)
   await sandbox.exec(
     `cd /home/user && tar czf ${archivePath} ${WORKSPACE_EXCLUDES} workspace/ 2>&1`,
   );
 
-  // Stream the archive from the container → R2
-  const stream = await sandbox.readFileStream(archivePath);
-  const uploaded = await env.R2_BUCKET.put(r2Key, stream);
+  // Base64-encode inside the container so we can read it as ASCII text
+  await sandbox.exec(`base64 ${archivePath} > ${b64Path}`);
 
-  // Clean up temp file
-  await sandbox.exec(`rm -f ${archivePath}`);
+  // Read the base64 text (ASCII-safe) via exec in chunks
+  // First get the size to know how many chunks we need
+  const sizeResult = await sandbox.exec(`wc -c < ${b64Path}`);
+  const b64Size = parseInt(sizeResult.stdout?.trim() || '0', 10);
 
-  return { key: r2Key, size: uploaded?.size ?? 0 };
+  if (b64Size === 0) {
+    throw new Error('Failed to create workspace archive');
+  }
+
+  // Read base64 in chunks via exec (each exec has output limits)
+  // Use dd for precise byte-range reads
+  const CHUNK_SIZE = 200000; // ~200KB per read, well within exec limits
+  let b64String = '';
+  for (let offset = 0; offset < b64Size; offset += CHUNK_SIZE) {
+    const count = Math.min(CHUNK_SIZE, b64Size - offset);
+    const result = await sandbox.exec(
+      `dd if=${b64Path} bs=1 skip=${offset} count=${count} 2>/dev/null`,
+    );
+    b64String += result.stdout || '';
+  }
+
+  // Strip whitespace (base64 command adds line breaks)
+  b64String = b64String.replace(/\s/g, '');
+
+  // Decode from base64 to binary
+  const binaryString = atob(b64String);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+
+  await env.R2_BUCKET.put(r2Key, bytes.buffer);
+
+  // Clean up temp files
+  await sandbox.exec(`rm -f ${archivePath} ${b64Path}`);
+
+  return { key: r2Key, size: bytes.length };
 }
 
 /**
  * Restore a workspace from R2 into the container.
- * Uses base64 encoding for binary transfer (sandbox writeFile is string-only).
+ *
+ * The sandbox writeFile API uses UTF-8 encoding which corrupts binary data.
+ * Instead, we convert to base64 (ASCII-safe) and write it via shell commands,
+ * then decode inside the container.
+ *
  * Returns true if a snapshot was found and restored.
  */
 async function restoreWorkspace(
@@ -523,31 +568,68 @@ async function restoreWorkspace(
   key: string,
 ): Promise<boolean> {
   const r2Key = `workspaces/${key}.tar.gz`;
-  const archivePath = '/tmp/workspace-restore.tar.gz';
 
   // Check if snapshot exists in R2
   const obj = await env.R2_BUCKET.get(r2Key);
   if (!obj) return false;
 
-  // Convert R2 object to base64 and write via exec (writeFile is string-only)
+  // Convert binary → base64 (ASCII-safe for shell transport)
   const data = await obj.arrayBuffer();
-  const base64 = btoa(String.fromCharCode(...new Uint8Array(data)));
+  const bytes = new Uint8Array(data);
 
-  // Write base64 to container and decode
-  // Split into chunks to avoid shell argument limits
-  const chunkSize = 65536;
-  await sandbox.exec(`rm -f ${archivePath}`);
-  for (let i = 0; i < base64.length; i += chunkSize) {
-    const chunk = base64.slice(i, i + chunkSize);
-    await sandbox.exec(`echo -n '${chunk}' >> /tmp/workspace-b64`);
+  // Encode to base64 manually using Buffer-style approach
+  // We can't use btoa with fromCharCode on binary data that goes through
+  // writeFile (UTF-8 encoding corrupts bytes > 127).
+  // Instead, use the container's own base64 command to verify.
+  //
+  // Strategy: write raw base64 via small exec calls using heredoc,
+  // which avoids writeFile's UTF-8 mangling entirely.
+  const b64File = '/tmp/_ws_restore.b64';
+  const tarFile = '/tmp/_ws_restore.tar.gz';
+  await sandbox.exec(`rm -f ${b64File} ${tarFile}`);
+
+  // Use standard base64 encoding via a lookup table (avoids btoa/fromCharCode issues)
+  const base64Chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  let base64 = '';
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i];
+    const b = i + 1 < bytes.length ? bytes[i + 1] : 0;
+    const c = i + 2 < bytes.length ? bytes[i + 2] : 0;
+    base64 += base64Chars[a >> 2];
+    base64 += base64Chars[((a & 3) << 4) | (b >> 4)];
+    base64 += i + 1 < bytes.length ? base64Chars[((b & 15) << 2) | (c >> 6)] : '=';
+    base64 += i + 2 < bytes.length ? base64Chars[c & 63] : '=';
   }
-  await sandbox.exec(`base64 -d /tmp/workspace-b64 > ${archivePath} && rm /tmp/workspace-b64`);
 
-  // Extract (creates /home/user/workspace/)
-  await sandbox.exec(`cd /home/user && tar xzf ${archivePath} 2>&1`);
+  // Write base64 string to container in chunks via shell
+  // Base64 is pure ASCII (A-Za-z0-9+/=) so shell-safe in single quotes
+  const CHUNK_SIZE = 50000; // well under ARG_MAX
+  for (let i = 0; i < base64.length; i += CHUNK_SIZE) {
+    const chunk = base64.slice(i, i + CHUNK_SIZE);
+    await sandbox.exec(`printf '%s' '${chunk}' >> ${b64File}`);
+  }
+
+  // Decode and extract
+  const decodeResult = await sandbox.exec(
+    `base64 -d ${b64File} > ${tarFile} 2>&1 && echo DECODE_OK || echo DECODE_FAIL`,
+  );
+  if (!decodeResult.stdout?.includes('DECODE_OK')) {
+    console.error('restoreWorkspace: base64 decode failed:', decodeResult.stdout, decodeResult.stderr);
+    await sandbox.exec(`rm -f ${b64File} ${tarFile}`);
+    return false;
+  }
+
+  const extractResult = await sandbox.exec(
+    `cd /home/user && tar xzf ${tarFile} 2>&1 && echo EXTRACT_OK || echo EXTRACT_FAIL`,
+  );
+  if (!extractResult.stdout?.includes('EXTRACT_OK')) {
+    console.error('restoreWorkspace: tar extract failed:', extractResult.stdout, extractResult.stderr);
+    await sandbox.exec(`rm -f ${b64File} ${tarFile}`);
+    return false;
+  }
 
   // Clean up
-  await sandbox.exec(`rm -f ${archivePath}`);
+  await sandbox.exec(`rm -f ${b64File} ${tarFile}`);
 
   return true;
 }
