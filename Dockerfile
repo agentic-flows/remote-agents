@@ -24,6 +24,10 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 COPY bin/lb /usr/local/bin/lb
 RUN chmod +x /usr/local/bin/lb
 
+# Pre-install local MCP servers so they're available without npm download delay
+# (context7 and ref-tools-docs are remote MCP — no local install needed)
+RUN npm install -g @modelcontextprotocol/server-fetch 2>/dev/null || true
+
 # Workspace directory for cloned repos
 RUN mkdir -p /home/user/workspace
 
