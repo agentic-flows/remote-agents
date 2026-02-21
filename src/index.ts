@@ -12,6 +12,10 @@
  * 7. Exec      — POST /api/exec                 → run command in container (debug)
  * 8. Sessions  — GET  /api/sessions             → list all sessions
  * 9. Profiles  — GET  /api/profiles             → list available agent profiles
+ * 10. Ws Save  — POST /api/workspace/save       → save workspace to R2
+ * 11. Ws List  — GET  /api/workspace/list       → list saved workspaces
+ * 12. Ws Del   — DELETE /api/workspace/:name    → delete a named workspace
+ * 13. Ws File  — GET  /api/workspace/file/*     → read file from workspace
  *
  * Based on the sandbox-sdk opencode-remote reference example.
  *
@@ -46,11 +50,18 @@ export class Sandbox extends BaseSandbox<Env> {
         model_id TEXT,
         repo TEXT,
         branch TEXT,
+        workspace_key TEXT,
         status TEXT DEFAULT 'dispatched',
         created_at TEXT DEFAULT (datetime('now')),
         updated_at TEXT DEFAULT (datetime('now'))
       )
     `);
+    // Add workspace_key column if it doesn't exist (migration for existing DOs)
+    try {
+      ctx.storage.sql.exec(`ALTER TABLE session_log ADD COLUMN workspace_key TEXT`);
+    } catch {
+      // Column already exists — ignore
+    }
     ctx.storage.sql.exec(`
       CREATE TABLE IF NOT EXISTS session_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -75,10 +86,11 @@ export class Sandbox extends BaseSandbox<Env> {
     model: { providerID: string; modelID: string };
     repo?: string;
     branch?: string;
+    workspaceKey?: string;
   }) {
     this.ctx.storage.sql.exec(
-      `INSERT OR REPLACE INTO session_log (session_id, issue_id, prompt, model_provider, model_id, repo, branch, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'dispatched')`,
+      `INSERT OR REPLACE INTO session_log (session_id, issue_id, prompt, model_provider, model_id, repo, branch, workspace_key, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'dispatched')`,
       data.sessionId,
       data.issueId ?? null,
       data.prompt,
@@ -86,6 +98,7 @@ export class Sandbox extends BaseSandbox<Env> {
       data.model.modelID,
       data.repo ?? null,
       data.branch ?? null,
+      data.workspaceKey ?? null,
     );
   }
 
@@ -344,7 +357,13 @@ async function getClient(
 async function setupWorkspace(
   sandbox: ReturnType<typeof getSandbox>,
   env: Env,
-  opts: { repo?: string; project?: string; branch?: string; setupLb?: boolean },
+  opts: {
+    repo?: string;
+    project?: string;
+    branch?: string;
+    setupLb?: boolean;
+    workspace?: string; // named workspace to restore from R2
+  },
 ): Promise<string | null> {
   // Clean workspace
   await sandbox.exec(`cd /tmp && rm -rf ${WORK_DIR}`);
@@ -376,6 +395,14 @@ async function setupWorkspace(
         `cd ${WORK_DIR} && gh repo create agentic-flows/${opts.project} --private --source=. --push 2>&1`,
       );
       repoUrl = `https://github.com/agentic-flows/${opts.project}.git`;
+    }
+  } else if (opts.workspace) {
+    // Named workspace — try to restore from R2 first
+    const restored = await restoreWorkspace(sandbox, env, `named/${opts.workspace}`);
+    if (!restored) {
+      // No existing snapshot — create fresh workspace
+      await sandbox.exec(`mkdir -p ${WORK_DIR}`);
+      await sandbox.exec(`cd ${WORK_DIR} && git init -b main`);
     }
   } else {
     // Bare workspace — no git remote
@@ -441,6 +468,105 @@ async function setupWorkspace(
   return repoUrl;
 }
 
+// ---------------------------------------------------------------------------
+// R2 Workspace Persistence
+// ---------------------------------------------------------------------------
+// Workspace snapshots are stored in R2 as tar.gz archives.
+// Keys: workspaces/<name>.tar.gz (named) or workspaces/session-<id>.tar.gz
+//
+// Excludes: node_modules, .git, __pycache__, .next, dist (to keep archives small)
+const WORKSPACE_EXCLUDES = [
+  '--exclude=node_modules',
+  '--exclude=.git',
+  '--exclude=__pycache__',
+  '--exclude=.next',
+  '--exclude=dist',
+  '--exclude=.opencode',
+].join(' ');
+
+/**
+ * Save the current workspace to R2 as a compressed tar archive.
+ * Uses readFileStream for binary transfer (sandbox readFile is string-only).
+ * Returns the R2 key used.
+ */
+async function saveWorkspace(
+  sandbox: ReturnType<typeof getSandbox>,
+  env: Env,
+  key: string,
+): Promise<{ key: string; size: number }> {
+  const r2Key = `workspaces/${key}.tar.gz`;
+  const archivePath = '/tmp/workspace-snapshot.tar.gz';
+
+  // Create compressed archive (excluding heavy dirs)
+  await sandbox.exec(
+    `cd /home/user && tar czf ${archivePath} ${WORKSPACE_EXCLUDES} workspace/ 2>&1`,
+  );
+
+  // Stream the archive from the container → R2
+  const stream = await sandbox.readFileStream(archivePath);
+  const uploaded = await env.R2_BUCKET.put(r2Key, stream);
+
+  // Clean up temp file
+  await sandbox.exec(`rm -f ${archivePath}`);
+
+  return { key: r2Key, size: uploaded?.size ?? 0 };
+}
+
+/**
+ * Restore a workspace from R2 into the container.
+ * Uses base64 encoding for binary transfer (sandbox writeFile is string-only).
+ * Returns true if a snapshot was found and restored.
+ */
+async function restoreWorkspace(
+  sandbox: ReturnType<typeof getSandbox>,
+  env: Env,
+  key: string,
+): Promise<boolean> {
+  const r2Key = `workspaces/${key}.tar.gz`;
+  const archivePath = '/tmp/workspace-restore.tar.gz';
+
+  // Check if snapshot exists in R2
+  const obj = await env.R2_BUCKET.get(r2Key);
+  if (!obj) return false;
+
+  // Convert R2 object to base64 and write via exec (writeFile is string-only)
+  const data = await obj.arrayBuffer();
+  const base64 = btoa(String.fromCharCode(...new Uint8Array(data)));
+
+  // Write base64 to container and decode
+  // Split into chunks to avoid shell argument limits
+  const chunkSize = 65536;
+  await sandbox.exec(`rm -f ${archivePath}`);
+  for (let i = 0; i < base64.length; i += chunkSize) {
+    const chunk = base64.slice(i, i + chunkSize);
+    await sandbox.exec(`echo -n '${chunk}' >> /tmp/workspace-b64`);
+  }
+  await sandbox.exec(`base64 -d /tmp/workspace-b64 > ${archivePath} && rm /tmp/workspace-b64`);
+
+  // Extract (creates /home/user/workspace/)
+  await sandbox.exec(`cd /home/user && tar xzf ${archivePath} 2>&1`);
+
+  // Clean up
+  await sandbox.exec(`rm -f ${archivePath}`);
+
+  return true;
+}
+
+/**
+ * Resolve the R2 workspace key from request params.
+ * Priority: explicit workspace name > issueId > sessionId
+ */
+function resolveWorkspaceKey(opts: {
+  workspace?: string;
+  issueId?: string;
+  sessionId?: string;
+}): string {
+  if (opts.workspace) return `named/${opts.workspace}`;
+  if (opts.issueId) return `issue/${opts.issueId}`;
+  if (opts.sessionId) return `session/${opts.sessionId}`;
+  return `session/${crypto.randomUUID()}`;
+}
+
 // ===========================================================================
 // Router
 // ===========================================================================
@@ -498,6 +624,29 @@ export default {
     const snapshotMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/snapshot$/);
     if (request.method === 'POST' && snapshotMatch) {
       return handleSnapshot(sandbox, env, snapshotMatch[1]);
+    }
+
+    // POST /api/workspace/save — save workspace to R2
+    // Body: { "workspace": "name" } or { "sessionId": "..." } or { "issueId": "..." }
+    if (request.method === 'POST' && url.pathname === '/api/workspace/save') {
+      return handleWorkspaceSave(sandbox, env, request);
+    }
+
+    // GET /api/workspace/list — list saved workspaces in R2
+    if (request.method === 'GET' && url.pathname === '/api/workspace/list') {
+      return handleWorkspaceList(env);
+    }
+
+    // DELETE /api/workspace/:name — delete a named workspace from R2
+    const deleteWorkspaceMatch = url.pathname.match(/^\/api\/workspace\/([^/]+)$/);
+    if (request.method === 'DELETE' && deleteWorkspaceMatch) {
+      return handleWorkspaceDelete(env, deleteWorkspaceMatch[1]);
+    }
+
+    // GET /api/workspace/file/* — read a file from the live container workspace
+    if (request.method === 'GET' && url.pathname.startsWith('/api/workspace/file/')) {
+      const filePath = url.pathname.slice('/api/workspace/file/'.length);
+      return handleWorkspaceFile(sandbox, filePath);
     }
 
     // GET /api/profiles — list available agent profiles
@@ -652,6 +801,7 @@ async function handleDispatch(
       model,
       repo: body.repo,
       branch,
+      workspaceKey: `issue/${issueId}`,
     });
 
     return Response.json({
@@ -717,12 +867,14 @@ ${issueDescription}
 // POST /api/kickoff — raw prompt
 // Body: { "text": "...", "repo"?: "...", "project"?: "...", "branch"?: "...",
 //         "model"?: { "providerID": "...", "modelID": "..." },
-//         "mcp"?: { ... }, "system"?: "...", "profile"?: "researcher" }
+//         "mcp"?: { ... }, "system"?: "...", "profile"?: "researcher",
+//         "workspace"?: "my-scraper" }
 //
-// Three workspace modes:
+// Four workspace modes:
 //   1. "repo": "https://..." — clone existing repo
 //   2. "project": "my-research" — create/clone github.com/agentic-flows/my-research
-//   3. Neither — ephemeral workspace (no persistence)
+//   3. "workspace": "name" — named R2 workspace (persists across sessions)
+//   4. Neither — ephemeral workspace (no persistence)
 // ===========================================================================
 async function handleKickoff(
   sandbox: ReturnType<typeof getSandbox>,
@@ -739,6 +891,7 @@ async function handleKickoff(
       mcp?: Config['mcp'];
       system?: string;
       profile?: string;
+      workspace?: string; // named workspace — persists across sessions via R2
     };
     if (!body.text) {
       return Response.json({ error: 'Missing "text" in request body' }, { status: 400 });
@@ -757,6 +910,7 @@ async function handleKickoff(
       repo: body.repo,
       project: body.project,
       branch: body.branch,
+      workspace: body.workspace,
       setupLb: false,
     });
 
@@ -766,7 +920,11 @@ async function handleKickoff(
     const { client } = await getClient(sandbox, env, mergedMcp);
 
     const session = await client.session.create({
-      title: body.project ? `Project: ${body.project}` : 'Remote Agent',
+      title: body.workspace
+        ? `Workspace: ${body.workspace}`
+        : body.project
+          ? `Project: ${body.project}`
+          : 'Remote Agent',
       directory: WORK_DIR,
     });
     if (!session.data) {
@@ -777,6 +935,8 @@ async function handleKickoff(
     let promptText = body.text;
     if (repoUrl) {
       promptText += `\n\n## Persistence\n\nYour workspace is backed by a GitHub repo: ${repoUrl}\nWhen you are done, commit all your work and push it so nothing is lost.\nUse: \`git add -A && git commit -m "description" && git push\`\nIf pushing fails with auth errors, use: \`git push https://\${GH_TOKEN}@github.com/... HEAD:refs/heads/main\``;
+    } else if (body.workspace) {
+      promptText += `\n\n## Persistence\n\nYour workspace is a named R2 workspace: "${body.workspace}"\nYour work will be automatically saved when the session completes.\nYou do not need to push to git unless you want to — files persist in R2.`;
     }
 
     // Resolve system prompt: explicit > profile > none
@@ -795,12 +955,18 @@ async function handleKickoff(
       parts: [{ type: 'text', text: fullPrompt }],
     });
 
+    // Resolve the workspace key for later save operations
+    const workspaceKey = body.workspace
+      ? `named/${body.workspace}`
+      : undefined;
+
     // Persist session log to DO SQLite (survives container hibernation)
     await (sandbox as Sandbox).logSession({
       sessionId: session.data.id,
       prompt: fullPrompt,
       model,
       repo: repoUrl ?? undefined,
+      workspaceKey,
     });
 
     return Response.json({
@@ -809,6 +975,8 @@ async function handleKickoff(
       model,
       repo: repoUrl,
       profile: body.profile ?? null,
+      workspace: body.workspace ?? null,
+      workspaceKey: workspaceKey ?? null,
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
@@ -1039,5 +1207,119 @@ async function handleSnapshot(
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown error';
     return Response.json({ error: `Failed to snapshot (container may be dead): ${message}` }, { status: 500 });
+  }
+}
+
+// ===========================================================================
+// POST /api/workspace/save — save workspace to R2
+// Body: { "workspace"?: "name", "sessionId"?: "...", "issueId"?: "..." }
+// At least one identifier required to determine the R2 key.
+// ===========================================================================
+async function handleWorkspaceSave(
+  sandbox: ReturnType<typeof getSandbox>,
+  env: Env,
+  request: Request,
+): Promise<Response> {
+  try {
+    const body = (await request.json()) as {
+      workspace?: string;
+      sessionId?: string;
+      issueId?: string;
+    };
+
+    const key = resolveWorkspaceKey(body);
+    const result = await saveWorkspace(sandbox, env, key);
+
+    return Response.json({
+      saved: true,
+      key: result.key,
+      size: result.size,
+      sizeHuman: `${(result.size / 1024 / 1024).toFixed(2)} MB`,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return Response.json({ error: `Failed to save workspace: ${message}` }, { status: 500 });
+  }
+}
+
+// ===========================================================================
+// GET /api/workspace/list — list saved workspaces in R2
+// ===========================================================================
+async function handleWorkspaceList(env: Env): Promise<Response> {
+  try {
+    const list = await env.R2_BUCKET.list({ prefix: 'workspaces/' });
+    const workspaces = list.objects.map((obj) => ({
+      key: obj.key,
+      name: obj.key.replace('workspaces/', '').replace('.tar.gz', ''),
+      size: obj.size,
+      sizeHuman: `${(obj.size / 1024 / 1024).toFixed(2)} MB`,
+      uploaded: obj.uploaded.toISOString(),
+    }));
+
+    return Response.json({ workspaces });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return Response.json({ error: message }, { status: 500 });
+  }
+}
+
+// ===========================================================================
+// DELETE /api/workspace/:name — delete a named workspace from R2
+// ===========================================================================
+async function handleWorkspaceDelete(env: Env, name: string): Promise<Response> {
+  try {
+    const key = `workspaces/named/${name}.tar.gz`;
+    await env.R2_BUCKET.delete(key);
+    return Response.json({ deleted: true, key });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return Response.json({ error: message }, { status: 500 });
+  }
+}
+
+// ===========================================================================
+// GET /api/workspace/file/* — read a file from the live container workspace
+// Returns the file content as text. For binary files, use /api/exec.
+// ===========================================================================
+async function handleWorkspaceFile(
+  sandbox: ReturnType<typeof getSandbox>,
+  filePath: string,
+): Promise<Response> {
+  try {
+    if (!filePath || filePath.includes('..')) {
+      return Response.json({ error: 'Invalid file path' }, { status: 400 });
+    }
+
+    const fullPath = `${WORK_DIR}/${filePath}`;
+
+    // Check if path is a directory
+    const checkResult = await sandbox.exec(`test -d "${fullPath}" && echo DIR || test -f "${fullPath}" && echo FILE || echo NOTFOUND`);
+    const type = checkResult.stdout?.trim();
+
+    if (type === 'NOTFOUND') {
+      return Response.json({ error: `File not found: ${filePath}` }, { status: 404 });
+    }
+
+    if (type === 'DIR') {
+      // List directory contents
+      const lsResult = await sandbox.exec(`ls -la "${fullPath}"`);
+      return Response.json({
+        type: 'directory',
+        path: filePath,
+        listing: lsResult.stdout,
+      });
+    }
+
+    // Read file content
+    const result = await sandbox.readFile(fullPath);
+    return new Response(result.content, {
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'X-File-Path': filePath,
+      },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Unknown error';
+    return Response.json({ error: message }, { status: 500 });
   }
 }
