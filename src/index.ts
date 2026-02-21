@@ -121,8 +121,20 @@ export default {
       return Response.json({ profiles });
     }
 
-    // Everything else: proxy to the opencode web UI
-    const server = await getServer(sandbox, env);
-    return proxyToOpencode(request, sandbox, server);
+    // Opencode web UI proxy (explicit route, not catch-all)
+    if (url.pathname.startsWith('/opencode')) {
+      const server = await getServer(sandbox, env);
+      return proxyToOpencode(request, sandbox, server);
+    }
+
+    // Everything else: static assets served by Workers Assets (vite-built SPA)
+    // Return 404 for unmatched API routes
+    if (url.pathname.startsWith('/api/')) {
+      return Response.json({ error: 'Not found' }, { status: 404 });
+    }
+
+    // For non-API routes, let the assets binding serve the SPA
+    // The vite plugin adds the __STATIC_CONTENT binding automatically
+    return new Response('Not found', { status: 404 });
   },
 };
