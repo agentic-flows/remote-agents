@@ -43,6 +43,15 @@ export default {
       return Response.json({ status: 'ok', timestamp: new Date().toISOString() });
     }
 
+    // --- Voice signaling routes → Orchestrator DO ---
+    // /voice/* routes need to reach the Orchestrator DO's onRequest() handler
+    // for SFU signaling (SDP exchange) and WebSocket adapter connections.
+    if (url.pathname.startsWith('/voice/')) {
+      const orchestratorId = env.Orchestrator.idFromName('main');
+      const orchestrator = env.Orchestrator.get(orchestratorId);
+      return orchestrator.fetch(request);
+    }
+
     // --- Orchestrator DO (WebSocket chat agent) ---
     // Routes: /agents/orchestrator/* via CF Agents SDK
     const agentResponse = await routeAgentRequest(request, env);

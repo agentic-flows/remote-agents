@@ -39,6 +39,11 @@ export interface CoreEnv {
   TWILIO_OUTBOUND_SID?: string;
   TWILIO_OUTBOUND_TOKEN?: string;
   TWILIO_OUTBOUND_NUMBER?: string;
+
+  // Cloudflare Calls SFU (for WebRTC voice transport)
+  REALTIME_SFU_APP_ID?: string;
+  REALTIME_SFU_BEARER_TOKEN?: string;
+  SFU_API_BASE?: string;
 }
 
 // =============================================================================

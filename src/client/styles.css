@@ -85,6 +85,18 @@ html, body, #root {
   border-radius: 4px;
 }
 
+.transport-badge {
+  color: var(--green);
+  padding: 2px 6px;
+  background: rgba(34, 197, 94, 0.1);
+  border: 1px solid rgba(34, 197, 94, 0.2);
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
 .clear-btn {
   padding: 4px 10px;
   background: var(--surface);

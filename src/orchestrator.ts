@@ -8,12 +8,15 @@
  *   - Conversation history, echo cancellation, barge-in
  *
  * This class adds:
- *   - Browser WebSocket transport (binary PCM frames, voice:start/stop control)
+ *   - WebRTC voice via Cloudflare Calls SFU (Opus codec, jitter buffering, echo cancellation)
+ *   - Fallback to raw PCM WebSocket transport if SFU credentials not configured
  *   - Text chat via @callable doChat RPC (same tools, shared history)
  *   - All Orchestrator tools (container lifecycle, session mgmt, workspace, lb)
  *
- * Pattern matches MyPhoneAgent from DREAM-agents — same VoiceAgent base,
- * different transport (browser WebSocket instead of Twilio media stream).
+ * WebRTC voice flow:
+ *   Browser mic → WebRTC (Opus) → SFU → WebSocket adapter → DO (48kHz stereo PCM)
+ *     → resample to 16kHz mono → STT (Flux) → LLM → TTS (Aura, 24kHz mono)
+ *     → resample to 48kHz stereo → WebSocket adapter → SFU → WebRTC (Opus) → browser speaker
  */
 
 import { getSandbox } from '@cloudflare/sandbox';
@@ -28,6 +31,16 @@ import { setupWorkspace, saveWorkspace, restoreWorkspace, resolveWorkspaceKey } 
 import { Sandbox } from './sandbox.js';
 import type { Config } from '@opencode-ai/sdk';
 
+// SFU integration
+import {
+  SfuClient,
+  buildWsCallbackUrl,
+  encodePcmForSfu,
+  extractPcmFromSfuPacket,
+  type SfuConfig,
+} from '../core/integrations/sfu/index.js';
+import { toMono16kFromStereo48k, resample24kToStereo48k } from '../core/integrations/sfu/sfu-audio.js';
+
 // =============================================================================
 // TYPES
 // =============================================================================
@@ -37,6 +50,26 @@ interface OrchestratorState extends VoiceAgentState {
   messageCount: number;
   lastActivity: string | null;
 }
+
+/** SFU session state tracked in memory (not persisted — voice sessions are ephemeral) */
+interface SfuVoiceState {
+  // TTS publish path (DO → SFU → browser)
+  ttsSessionId: string;       // SFU session for the TTS track
+  ttsAdapterId: string;       // WebSocket adapter ID for TTS
+  ttsTrackName: string;       // Track name published to SFU
+
+  // TTS player session (browser → SFU subscribe)
+  ttsPlayerSessionId?: string;  // Player SFU session created during connect
+
+  // STT subscribe path (browser → SFU → DO)
+  sttSessionId: string;       // SFU session for the mic track
+  sttTrackName: string;       // Mic track name from browser
+  sttAdapterId?: string;      // WebSocket adapter forwarding mic audio to DO
+  sttCallbackUrl: string;     // WebSocket callback URL for SFU → DO audio
+}
+
+// Chunk size for TTS audio sent to SFU (matches reference example)
+const TTS_BUFFER_CHUNK_SIZE = 8192;
 
 // =============================================================================
 // SYSTEM PROMPT
@@ -82,8 +115,9 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
 // =============================================================================
 
 export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
-  // Voice is active when browser has mic open
+  // Voice state
   private voiceActive = false;
+  private sfuState: SfuVoiceState | null = null;
 
   initialState: OrchestratorState = {
     callSid: null,
@@ -97,19 +131,9 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
   // VoiceAgent hooks
   // ---------------------------------------------------------------------------
 
-  protected getGreeting(): string {
-    // Not used — browser transport doesn't auto-greet (unlike Twilio).
-    // Abstract method requires implementation.
-    return '';
-  }
-
-  protected getSystemPrompt(): string {
-    return SYSTEM_PROMPT;
-  }
-
-  protected override getTools(): AnyToolDefinition[] {
-    return this.buildTools();
-  }
+  protected getGreeting(): string { return ''; }
+  protected getSystemPrompt(): string { return SYSTEM_PROMPT; }
+  protected override getTools(): AnyToolDefinition[] { return this.buildTools(); }
 
   // Browser needs linear16/24kHz (not Twilio mulaw/8kHz)
   protected override getTTSEncoding(): string { return 'linear16'; }
@@ -117,13 +141,383 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
   protected override getTTSSpeaker(): string { return 'asteria'; }
 
   // ---------------------------------------------------------------------------
-  // Browser WebSocket transport (like MyPhoneAgent's Twilio transport)
+  // SFU configuration helpers
+  // ---------------------------------------------------------------------------
+
+  private hasSfuCredentials(): boolean {
+    return !!(this.env.REALTIME_SFU_APP_ID && this.env.REALTIME_SFU_BEARER_TOKEN);
+  }
+
+  private getSfuConfig(): SfuConfig {
+    return {
+      sfuApiBase: this.env.SFU_API_BASE || 'https://rtc.live.cloudflare.com/v1',
+      appId: this.env.REALTIME_SFU_APP_ID!,
+      bearerToken: this.env.REALTIME_SFU_BEARER_TOKEN!,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // HTTP request handler — SFU signaling + WebSocket adapters
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Handle non-WebSocket HTTP requests to the Orchestrator DO.
+   * The Agent SDK calls this for requests that aren't WebSocket upgrades.
+   *
+   * Routes:
+   *   POST /voice/tts/publish     — Publish TTS track to SFU (called during voice:start)
+   *   POST /voice/tts/connect     — Browser subscribes to TTS track (SDP exchange)
+   *   POST /voice/stt/connect     — Browser publishes mic track (SDP exchange)
+   *   POST /voice/stt/start-forwarding — Start SFU → DO audio forwarding
+   *   POST /voice/stt/stop-forwarding  — Stop forwarding
+   *   WS   /voice/tts/subscribe   — SFU connects here to receive TTS audio
+   *   WS   /voice/stt/sfu-subscribe — SFU connects here to deliver mic audio
+   */
+  async onRequest(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // WebSocket upgrade requests from the SFU
+    if (request.headers.get('Upgrade') === 'websocket') {
+      if (path.endsWith('/voice/tts/subscribe')) {
+        return this.handleTtsSubscribe();
+      }
+      if (path.endsWith('/voice/stt/sfu-subscribe')) {
+        return this.handleSttSfuSubscribe();
+      }
+      return new Response('Unknown WebSocket endpoint', { status: 404 });
+    }
+
+    // HTTP POST endpoints for signaling
+    if (request.method === 'POST') {
+      if (path.endsWith('/voice/tts/publish')) {
+        return this.handleTtsPublish(request);
+      }
+      if (path.endsWith('/voice/tts/connect')) {
+        return this.handleTtsConnect(request);
+      }
+      if (path.endsWith('/voice/tts/renegotiate')) {
+        return this.handleTtsRenegotiate(request);
+      }
+      if (path.endsWith('/voice/stt/connect')) {
+        return this.handleSttConnect(request);
+      }
+      if (path.endsWith('/voice/stt/start-forwarding')) {
+        return this.handleSttStartForwarding();
+      }
+      if (path.endsWith('/voice/stt/stop-forwarding')) {
+        return this.handleSttStopForwarding();
+      }
+    }
+
+    return new Response('Not Found', { status: 404 });
+  }
+
+  // ---------------------------------------------------------------------------
+  // TTS SFU Handlers (DO → SFU → browser)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * WebSocket upgrade: SFU connects here to receive TTS audio from the DO.
+   * The DO pushes encoded SFU packets (48kHz stereo PCM) to this WebSocket.
+   */
+  private handleTtsSubscribe(): Response {
+    const [client, server] = Object.values(new WebSocketPair());
+    // Don't use Agent SDK's acceptWebSocket — these are raw SFU connections
+    server.accept();
+    // Tag the socket for identification
+    (server as any).__sfuRole = 'tts-subscriber';
+
+    // Store reference so TTS audio can be pushed to it
+    this._ttsSfuSocket = server;
+
+    server.addEventListener('close', () => {
+      console.log('[SFU/TTS] Subscriber WebSocket closed');
+      if (this._ttsSfuSocket === server) this._ttsSfuSocket = null;
+    });
+    server.addEventListener('error', (e: any) => {
+      console.error('[SFU/TTS] Subscriber WebSocket error:', e);
+    });
+
+    console.log('[SFU/TTS] Subscriber WebSocket connected');
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /** TTS SFU subscriber WebSocket */
+  private _ttsSfuSocket: WebSocket | null = null;
+
+  /**
+   * POST /voice/tts/publish — Create SFU WebSocket adapter for TTS.
+   * The SFU will connect back to our /voice/tts/subscribe endpoint to receive audio.
+   */
+  private async handleTtsPublish(request: Request): Promise<Response> {
+    if (!this.hasSfuCredentials()) {
+      return new Response('SFU credentials not configured', { status: 500 });
+    }
+    if (this.sfuState?.ttsAdapterId) {
+      return new Response('TTS already published', { status: 409 });
+    }
+
+    const trackName = `orchestrator-tts-${Date.now()}`;
+    const subscribeUrl = buildWsCallbackUrl(request, '/voice/tts/subscribe');
+
+    console.log(`[SFU/TTS] Publishing track "${trackName}" with callback: ${subscribeUrl}`);
+
+    try {
+      const sfu = new SfuClient(this.getSfuConfig());
+      const { sessionId, adapterId, json } = await sfu.pushTrackFromWebSocket(trackName, subscribeUrl);
+
+      // Initialize or update SFU state
+      this.sfuState = {
+        ...this.sfuState!,
+        ttsSessionId: sessionId,
+        ttsAdapterId: adapterId,
+        ttsTrackName: trackName,
+      };
+
+      console.log(`[SFU/TTS] Published. Session: ${sessionId}, Adapter: ${adapterId}`);
+      return Response.json({ sessionId, adapterId, trackName, ...json });
+    } catch (e: any) {
+      console.error('[SFU/TTS] Publish failed:', e.message);
+      return new Response(`SFU publish failed: ${e.message}`, { status: 500 });
+    }
+  }
+
+  /**
+   * POST /voice/tts/connect — Browser subscribes to TTS audio track.
+   * Creates a player SFU session and pulls the TTS track.
+   * If SFU returns requiresImmediateRenegotiation: true, stores the player session ID
+   * and returns the response as-is so the browser can do the renegotiation round-trip.
+   */
+  private async handleTtsConnect(request: Request): Promise<Response> {
+    if (!this.sfuState?.ttsSessionId) {
+      return new Response('TTS not published yet', { status: 400 });
+    }
+
+    try {
+      const { sessionDescription } = (await request.json()) as any;
+      if (!sessionDescription) return new Response('Missing sessionDescription', { status: 400 });
+
+      const sfu = new SfuClient(this.getSfuConfig());
+      const { sessionId: playerSessionId } = await sfu.createSession();
+      const sfuAnswer = await sfu.pullRemoteTrackToPlayer(
+        playerSessionId,
+        this.sfuState.ttsSessionId,
+        this.sfuState.ttsTrackName,
+        sessionDescription,
+      );
+
+      // Always store the player session ID — needed for renegotiation
+      this.sfuState = { ...this.sfuState, ttsPlayerSessionId: playerSessionId };
+
+      console.log(`[SFU/TTS] Browser connect to TTS track via player session ${playerSessionId}`);
+      console.log(`[SFU/TTS] requiresImmediateRenegotiation: ${sfuAnswer?.requiresImmediateRenegotiation}, sessionDescription present: ${!!sfuAnswer?.sessionDescription}`);
+
+      // If SFU gave us a direct answer (track already live), normalize and return it
+      if (sfuAnswer?.sessionDescription?.sdp) {
+        if (!sfuAnswer.sessionDescription.type) sfuAnswer.sessionDescription.type = 'answer';
+        return Response.json(sfuAnswer);
+      }
+
+      // requiresImmediateRenegotiation: true — return as-is; browser will renegotiate
+      return Response.json(sfuAnswer);
+    } catch (e: any) {
+      console.error('[SFU/TTS] Connect failed:', e.message);
+      return new Response(`SFU connect failed: ${e.message}`, { status: 500 });
+    }
+  }
+
+  /**
+   * POST /voice/tts/renegotiate — Browser sends a new offer after requiresImmediateRenegotiation.
+   * Calls PUT /sessions/{playerSessionId}/renegotiate on the SFU and returns the real SDP answer.
+   */
+  private async handleTtsRenegotiate(request: Request): Promise<Response> {
+    if (!this.sfuState?.ttsPlayerSessionId) {
+      return new Response('No player session to renegotiate. Call /voice/tts/connect first.', { status: 400 });
+    }
+
+    try {
+      const { sessionDescription } = (await request.json()) as any;
+      if (!sessionDescription) return new Response('Missing sessionDescription', { status: 400 });
+
+      const sfu = new SfuClient(this.getSfuConfig());
+      const result = await sfu.renegotiateSession(this.sfuState.ttsPlayerSessionId, sessionDescription);
+
+      console.log(`[SFU/TTS] Renegotiation complete for player session ${this.sfuState.ttsPlayerSessionId}`);
+      return Response.json(result);
+    } catch (e: any) {
+      console.error('[SFU/TTS] Renegotiate failed:', e.message);
+      return new Response(`SFU renegotiate failed: ${e.message}`, { status: 500 });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // STT SFU Handlers (browser → SFU → DO)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * WebSocket upgrade: SFU connects here to deliver mic audio to the DO.
+   * The DO receives encoded SFU packets (48kHz stereo PCM), resamples to 16kHz mono, and feeds to STT.
+   */
+  private handleSttSfuSubscribe(): Response {
+    const [client, server] = Object.values(new WebSocketPair());
+    server.accept();
+    (server as any).__sfuRole = 'stt-subscriber';
+
+    server.addEventListener('message', (event: MessageEvent) => {
+      if (event.data instanceof ArrayBuffer && this.voiceActive) {
+        this.handleSfuMicAudio(event.data);
+      }
+    });
+    server.addEventListener('close', () => {
+      console.log('[SFU/STT] Audio subscriber WebSocket closed');
+    });
+    server.addEventListener('error', (e: any) => {
+      console.error('[SFU/STT] Audio subscriber WebSocket error:', e);
+    });
+
+    console.log('[SFU/STT] Audio subscriber WebSocket connected');
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  /**
+   * POST /voice/stt/connect — Browser publishes mic via WebRTC.
+   * Creates an SFU session and auto-discovers the mic track.
+   */
+  private async handleSttConnect(request: Request): Promise<Response> {
+    if (!this.hasSfuCredentials()) {
+      return new Response('SFU credentials not configured', { status: 500 });
+    }
+
+    try {
+      const { sessionDescription } = (await request.json()) as any;
+      if (!sessionDescription) return new Response('Missing sessionDescription', { status: 400 });
+
+      const sfu = new SfuClient(this.getSfuConfig());
+      const { sessionId } = await sfu.createSession();
+      const { json: publishResponse, audioTrackName } = await sfu.addTracksAutoDiscover(sessionId, sessionDescription);
+
+      if (!audioTrackName) {
+        throw new Error('Failed to get microphone track name from SFU response');
+      }
+
+      const sttCallbackUrl = buildWsCallbackUrl(request, '/voice/stt/sfu-subscribe');
+
+      // Store STT SFU state
+      this.sfuState = {
+        ...this.sfuState!,
+        sttSessionId: sessionId,
+        sttTrackName: audioTrackName,
+        sttCallbackUrl,
+      };
+
+      console.log(`[SFU/STT] Mic connected. Session: ${sessionId}, Track: ${audioTrackName}`);
+      // Ensure sessionDescription has type: 'answer' — SFU may omit it
+      if (publishResponse?.sessionDescription && !publishResponse.sessionDescription.type) {
+        publishResponse.sessionDescription.type = 'answer';
+      }
+      return Response.json(publishResponse);
+    } catch (e: any) {
+      console.error('[SFU/STT] Connect failed:', e.message);
+      return new Response(`SFU STT connect failed: ${e.message}`, { status: 500 });
+    }
+  }
+
+  /**
+   * POST /voice/stt/start-forwarding — Tell SFU to forward mic audio to our DO via WebSocket.
+   * Must be called after the browser's RTCPeerConnection reaches "connected" state.
+   */
+  private async handleSttStartForwarding(): Promise<Response> {
+    if (!this.sfuState?.sttSessionId || !this.sfuState?.sttTrackName || !this.sfuState?.sttCallbackUrl) {
+      return new Response('STT not connected yet. Call /voice/stt/connect first.', { status: 400 });
+    }
+    if (this.sfuState.sttAdapterId) {
+      return new Response('Forwarding already active', { status: 200 });
+    }
+
+    try {
+      const sfu = new SfuClient(this.getSfuConfig());
+      const { adapterId } = await sfu.pullTrackToWebSocket(
+        this.sfuState.sttSessionId,
+        this.sfuState.sttTrackName,
+        this.sfuState.sttCallbackUrl,
+      );
+
+      if (adapterId) {
+        this.sfuState.sttAdapterId = adapterId;
+        console.log(`[SFU/STT] Forwarding started. Adapter: ${adapterId}`);
+      }
+
+      return new Response('Forwarding started', { status: 200 });
+    } catch (e: any) {
+      console.error('[SFU/STT] Start forwarding failed:', e.message);
+      return new Response(`Start forwarding failed: ${e.message}`, { status: 500 });
+    }
+  }
+
+  /**
+   * POST /voice/stt/stop-forwarding — Stop SFU → DO mic audio forwarding.
+   */
+  private async handleSttStopForwarding(): Promise<Response> {
+    if (!this.sfuState?.sttAdapterId) {
+      return new Response('Forwarding not active', { status: 200 });
+    }
+
+    try {
+      const sfu = new SfuClient(this.getSfuConfig());
+      await sfu.closeWebSocketAdapter(this.sfuState.sttAdapterId);
+      this.sfuState.sttAdapterId = undefined;
+      console.log('[SFU/STT] Forwarding stopped');
+      return new Response('Forwarding stopped', { status: 200 });
+    } catch (e: any) {
+      console.error('[SFU/STT] Stop forwarding failed:', e.message);
+      return new Response(`Stop forwarding failed: ${e.message}`, { status: 500 });
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // SFU audio processing
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Process mic audio from SFU: decode protobuf packet, resample 48kHz stereo → 16kHz mono, send to STT.
+   */
+  private handleSfuMicAudio(packetData: ArrayBuffer): void {
+    const pcm48kStereo = extractPcmFromSfuPacket(packetData);
+    if (!pcm48kStereo) return;
+
+    // Resample 48kHz stereo → 16kHz mono for STT
+    const pcm16kMono = toMono16kFromStereo48k(pcm48kStereo);
+    this.sendAudioToSTT(pcm16kMono);
+  }
+
+  /**
+   * Send TTS audio chunk to the SFU via the TTS subscriber WebSocket.
+   * Resamples 24kHz mono → 48kHz stereo and wraps in protobuf packet.
+   */
+  private sendTtsToSfu(chunk24kMono: Uint8Array): void {
+    const ws = this._ttsSfuSocket;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+    // Resample 24kHz mono → 48kHz stereo for SFU
+    const stereo48k = resample24kToStereo48k(chunk24kMono.buffer as ArrayBuffer);
+
+    // Send in chunks, wrapped in SFU packet protobuf
+    for (let offset = 0; offset < stereo48k.byteLength; offset += TTS_BUFFER_CHUNK_SIZE) {
+      const slice = stereo48k.slice(offset, offset + TTS_BUFFER_CHUNK_SIZE);
+      ws.send(encodePcmForSfu(slice));
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Voice mode control
   // ---------------------------------------------------------------------------
 
   async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
-    // Binary frames = raw PCM audio from browser mic
+    // Binary frames = raw PCM audio from browser mic (fallback transport)
     if (message instanceof ArrayBuffer) {
-      if (this.voiceActive) {
+      if (this.voiceActive && !this.sfuState) {
+        // Fallback: raw PCM WebSocket transport (no SFU)
         this.sendAudioToSTT(message);
       }
       return;
@@ -152,25 +546,47 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
   private async startBrowserVoice(): Promise<void> {
     if (this.voiceActive) return;
     console.log('[Voice] Starting browser voice mode');
-    console.log('[Voice] env.AI:', this.env.AI);
-    console.log('[Voice] env.AI type:', typeof this.env.AI);
-    console.log('[Voice] env.AI.run type:', typeof this.env.AI?.run);
+
+    const useSfu = this.hasSfuCredentials();
+    console.log(`[Voice] Transport: ${useSfu ? 'WebRTC via SFU' : 'raw PCM WebSocket (fallback)'}`);
 
     try {
-      await this.initVoicePipeline({
-        onAudioChunk: (chunk: Uint8Array) => {
-          const buf = new ArrayBuffer(chunk.byteLength);
-          new Uint8Array(buf).set(chunk);
-          this.broadcast(buf);
-        },
-        onTTSFlushed: () => {
-          this.broadcast(JSON.stringify({ type: 'voice:tts:done' }));
-          this.setIsSpeaking(false);
-        },
-        onBargeIn: () => {
-          this.broadcast(JSON.stringify({ type: 'voice:tts:clear' }));
-        },
-      });
+      if (useSfu) {
+        // SFU transport: TTS audio goes through SFU → WebRTC → browser
+        await this.initVoicePipeline({
+          onAudioChunk: (chunk: Uint8Array) => {
+            this.sendTtsToSfu(chunk);
+          },
+          onTTSFlushed: () => {
+            // Send empty packet to signal end of TTS stream
+            const ws = this._ttsSfuSocket;
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(encodePcmForSfu(new ArrayBuffer(0)));
+            }
+            this.broadcast(JSON.stringify({ type: 'voice:tts:done' }));
+            this.setIsSpeaking(false);
+          },
+          onBargeIn: () => {
+            this.broadcast(JSON.stringify({ type: 'voice:tts:clear' }));
+          },
+        });
+      } else {
+        // Fallback: raw PCM WebSocket transport
+        await this.initVoicePipeline({
+          onAudioChunk: (chunk: Uint8Array) => {
+            const buf = new ArrayBuffer(chunk.byteLength);
+            new Uint8Array(buf).set(chunk);
+            this.broadcast(buf);
+          },
+          onTTSFlushed: () => {
+            this.broadcast(JSON.stringify({ type: 'voice:tts:done' }));
+            this.setIsSpeaking(false);
+          },
+          onBargeIn: () => {
+            this.broadcast(JSON.stringify({ type: 'voice:tts:clear' }));
+          },
+        });
+      }
     } catch (e) {
       console.error('[Voice] Pipeline init failed:', e);
       this.broadcast(JSON.stringify({ type: 'voice:error', error: `Voice init failed: ${e}` }));
@@ -178,7 +594,10 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
     }
 
     this.voiceActive = true;
-    this.broadcast(JSON.stringify({ type: 'voice:started' }));
+    this.broadcast(JSON.stringify({
+      type: 'voice:started',
+      transport: useSfu ? 'webrtc' : 'websocket',
+    }));
     console.log('[Voice] Browser voice mode active');
   }
 
@@ -186,6 +605,29 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
     console.log('[Voice] Stopping browser voice mode');
     this.voiceActive = false;
     this.cleanupVoicePipeline();
+
+    // Clean up SFU adapters
+    if (this.sfuState && this.hasSfuCredentials()) {
+      const sfu = new SfuClient(this.getSfuConfig());
+      try {
+        if (this.sfuState.sttAdapterId) {
+          await sfu.closeWebSocketAdapter(this.sfuState.sttAdapterId);
+        }
+        if (this.sfuState.ttsAdapterId) {
+          await sfu.closeWebSocketAdapter(this.sfuState.ttsAdapterId);
+        }
+      } catch (e) {
+        console.error('[Voice] SFU cleanup error:', e);
+      }
+      this.sfuState = null;
+    }
+
+    // Close SFU WebSockets
+    if (this._ttsSfuSocket) {
+      try { this._ttsSfuSocket.close(1000, 'Voice stopped'); } catch {}
+      this._ttsSfuSocket = null;
+    }
+
     this.broadcast(JSON.stringify({ type: 'voice:stopped' }));
   }
 
@@ -283,6 +725,7 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
       ok: true,
       messageCount: this.state.messageCount || 0,
       voiceActive: this.voiceActive,
+      sfuActive: !!this.sfuState,
       timestamp: new Date().toISOString(),
     };
   }
