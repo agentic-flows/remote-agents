@@ -696,11 +696,13 @@ export function App() {
         break;
 
       case 'chat:stream:chunk':
-        streamingContentRef.current += data.content;
+        if (streamingIdRef.current === data.id) {
+          streamingContentRef.current += data.content;
+        }
         setMessages(prev =>
           prev.map(m =>
-            m.id === streamingIdRef.current
-              ? { ...m, content: streamingContentRef.current }
+            m.id === data.id
+              ? { ...m, content: (m.content ?? '') + data.content }
               : m,
           ),
         );
@@ -709,14 +711,29 @@ export function App() {
       case 'chat:stream:end':
         setMessages(prev =>
           prev.map(m =>
-            m.id === streamingIdRef.current
+            m.id === data.id
               ? { ...m, content: data.content, streaming: false }
               : m,
           ),
         );
-        setIsStreaming(false);
-        streamingIdRef.current = '';
-        streamingContentRef.current = '';
+        if (streamingIdRef.current === data.id) {
+          setIsStreaming(false);
+          streamingIdRef.current = '';
+          streamingContentRef.current = '';
+        }
+        break;
+
+      case 'chat:message':
+        setMessages(prev => [
+          ...prev,
+          {
+            id: data.id,
+            role: (data.role as 'user' | 'assistant') ?? 'assistant',
+            content: data.content,
+            timestamp: new Date().toISOString(),
+            streaming: false,
+          },
+        ]);
         break;
 
       case 'rpc': {
@@ -728,21 +745,16 @@ export function App() {
         break;
       }
 
-      case 'agent:event': {
-        const { sessionId, label, event } = data as {
-          sessionId: string;
-          label: string;
-          event: { type: string; properties?: Record<string, unknown> };
-        };
+      // agent:event is no longer sent over WebSocket (replaced by HTTP polling)
+      // Kept as a no-op to avoid console errors if old messages arrive
+
+      case 'agent:session:started': {
+        // Register new agent session — polling hook will pick it up automatically
+        const { sessionId, label } = data as { sessionId: string; label: string };
         setAgentSessions(prev => {
+          if (prev.has(sessionId)) return prev;
           const next = new Map(prev);
-          const session = next.get(sessionId) ?? { label, events: [] };
-          const newEvent: AgentEvent = {
-            id: `${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
-            event,
-            timestamp: new Date().toISOString(),
-          };
-          next.set(sessionId, { ...session, events: [...session.events.slice(-199), newEvent] });
+          next.set(sessionId, { label, events: [] });
           return next;
         });
         setActiveSessionTab(prev => prev ?? sessionId);
@@ -755,6 +767,54 @@ export function App() {
   useEffect(() => {
     handleMessageRef.current = handleMessage;
   }, [handleMessage]);
+
+  // Poll /api/session/:id/events for each active session every 1s
+  const lastTsRef = useRef<Map<string, number>>(new Map());
+  useEffect(() => {
+    if (agentSessions.size === 0) return;
+    const sessionIds = Array.from(agentSessions.keys());
+
+    const poll = async () => {
+      await Promise.all(
+        sessionIds.map(async (sessionId) => {
+          const since = lastTsRef.current.get(sessionId) ?? 0;
+          try {
+            const res = await fetch(`/api/session/${sessionId}/events?since=${since}`);
+            if (!res.ok) return;
+            const { events } = await res.json() as {
+              events: Array<{ id: number; session_id: string; label: string; event_type: string; event_json: string; ts: number }>;
+            };
+            if (!events || events.length === 0) return;
+
+            // Update lastTs so we only fetch new events next poll
+            const maxTs = Math.max(...events.map(e => e.ts));
+            lastTsRef.current.set(sessionId, maxTs);
+
+            setAgentSessions(prev => {
+              const next = new Map(prev);
+              const existing = next.get(sessionId);
+              if (!existing) return prev;
+              const newEvents: AgentEvent[] = events.map(e => ({
+                id: `${sessionId}-${e.id}`,
+                event: JSON.parse(e.event_json) as { type: string; properties?: Record<string, unknown> },
+                timestamp: new Date(e.ts).toISOString(),
+              }));
+              next.set(sessionId, {
+                ...existing,
+                events: [...existing.events.slice(-199), ...newEvents].slice(-200),
+              });
+              return next;
+            });
+          } catch {
+            // Network errors are non-fatal — retry on next tick
+          }
+        }),
+      );
+    };
+
+    const intervalId = setInterval(poll, 1000);
+    return () => clearInterval(intervalId);
+  }, [agentSessions.size]);
 
   // Auto-scroll to bottom
   useEffect(() => {

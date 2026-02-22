@@ -73,7 +73,7 @@ export abstract class VoiceAgent<
   protected tts: CloudflareAuraTTS | null = null;
 
   // --- LLM Config ---
-  protected modelName: AIModels = 'openai/gpt-4.1-nano';
+  protected modelName: AIModels = 'openai/gpt-4.1';
   protected llmTemperature: number | undefined = undefined;
   protected llmMaxTokens: number | undefined = undefined;
   protected gatewayName: string = 'phone-agent';
@@ -88,6 +88,7 @@ export abstract class VoiceAgent<
   /**
    * Number of words caller must say to trigger barge-in (EagerEndOfTurn sensitivity).
    * Fewer words = lower eager_eot_threshold = easier to interrupt. Default 2.
+   * Industry standard (Twilio/Deepgram defaults): 2 words.
    */
   protected numWordsToInterrupt: number = 2;
   /**
@@ -99,6 +100,15 @@ export abstract class VoiceAgent<
    * Seconds of silence after barge-in before agent resumes speaking. Default 1.0s.
    */
   protected backoffSecondsAfterInterruption: number = 1.0;
+  /**
+   * Milliseconds to hold isSpeaking=true after TTS flushes, covering the full
+   * speaker-to-mic round-trip: SFU buffer → WebRTC jitter → browser decode →
+   * DAC → speaker → room → mic → WebRTC → SFU → DO.
+   * Without this delay, the DO clears isSpeaking the moment audio is *sent* to
+   * the SFU, allowing STT to pick up the still-playing TTS audio as user speech.
+   * Default 500ms. Set to 0 to disable (e.g., headphone users won't need this).
+   */
+  protected postSpeechDelayMs: number = 500;
 
   // --- LLM Control ---
   // DO NOT MODIFY - follows Deepgram docs: .opencode/knowledge/flux/06-eager-eot.md
@@ -135,7 +145,7 @@ export abstract class VoiceAgent<
 
   constructor(ctx: AgentContext, env: TEnv) {
     super(ctx, env);
-    this.modelName = (env.LLM_MODEL || 'openai/gpt-4.1-nano') as AIModels;
+    this.modelName = (env.LLM_MODEL || 'openai/gpt-4.1') as AIModels;
     this.gatewayName = env.AI_GATEWAY_NAME || 'phone-agent';
     this.llmMetrics.setModel(this.modelName);
     console.log(`LLM configured: ${this.modelName} via gateway ${this.gatewayName}`);
@@ -165,6 +175,26 @@ export abstract class VoiceAgent<
 
   /** Override to return a hardcoded first response (skips LLM for lower latency). */
   protected getFirstResponseOverride(): string | null { return null; }
+
+  /**
+   * Called on EndOfTurn with the finalized user transcript.
+   * Override to broadcast or persist what the user said.
+   */
+  protected onVoiceTranscript?(text: string): void;
+
+  /**
+   * Called after the LLM finishes generating a response and TTS flush is triggered.
+   * Override to broadcast or persist what the assistant said.
+   */
+  protected onVoiceResponse?(text: string): void;
+
+  /**
+   * Called for each streaming chunk from the LLM during a voice response.
+   * Override to stream text to the UI in real time.
+   * @param chunk - The new text chunk
+   * @param msgId - Stable ID for this response (same across all chunks)
+   */
+  protected onVoiceResponseChunk?(chunk: string, msgId: string): void;
 
   // ===========================================================================
   // BUILDING BLOCKS — App calls these from its transport handlers
@@ -362,6 +392,24 @@ export abstract class VoiceAgent<
   }
 
   /**
+   * Clear isSpeaking after postSpeechDelayMs.
+   * Call this from onTTSFlushed instead of setIsSpeaking(false) directly.
+   * The delay covers the full speaker-to-mic round-trip so that STT does not
+   * pick up TTS audio still playing through speakers as user speech.
+   * If postSpeechDelayMs is 0, clears immediately.
+   */
+  protected clearIsSpeakingAfterDelay(): void {
+    if (this.postSpeechDelayMs <= 0) {
+      this.setIsSpeaking(false);
+      return;
+    }
+    console.log(`[Echo] Holding isSpeaking=true for ${this.postSpeechDelayMs}ms post-speech`);
+    setTimeout(() => {
+      this.setIsSpeaking(false);
+    }, this.postSpeechDelayMs);
+  }
+
+  /**
    * Convert Twilio mulaw base64 to PCM 16kHz ArrayBuffer.
    * Exposed as a utility for the app layer.
    */
@@ -437,6 +485,7 @@ export abstract class VoiceAgent<
       case 'EndOfTurn':
         console.log(`[Flux] ${event} turn=${turn_index} "${transcript || ''}"`);
         if (transcript?.trim()) {
+          this.onVoiceTranscript?.(transcript.trim());
           this.finalizeResponse(transcript);
         }
         break;
@@ -493,6 +542,7 @@ export abstract class VoiceAgent<
 
       let fullText = '';
       let firstChunk = true;
+      const responseMsgId = `voice-asst-${Date.now()}`;
 
       const result = await infer({
         env: this.env,
@@ -514,7 +564,10 @@ export abstract class VoiceAgent<
               firstChunk = false;
             }
             fullText += chunk;
-            if (chunk) this.tts?.speak(chunk);
+            if (chunk) {
+              this.tts?.speak(chunk);
+              this.onVoiceResponseChunk?.(chunk, responseMsgId);
+            }
           },
         },
       });
@@ -544,6 +597,7 @@ export abstract class VoiceAgent<
       // Flush once at the end to generate all audio
       if (fullText.trim()) {
         this.tts?.flush();
+        this.onVoiceResponse?.(fullText.trim());
       }
 
     } catch (e: unknown) {

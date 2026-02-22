@@ -30,7 +30,7 @@ import { WORK_DIR, DEFAULT_MODEL, AGENT_PROFILES, getClient } from './config.js'
 import { setupWorkspace, saveWorkspace, restoreWorkspace, resolveWorkspaceKey } from './workspace.js';
 import { Sandbox } from './sandbox.js';
 import { listIssues, getIssue, updateIssueState, createIssue, formatIssueList, formatIssueDetail } from './linear.js';
-import type { Config, Event as OcEvent } from '@opencode-ai/sdk';
+import type { Config } from '@opencode-ai/sdk';
 
 // SFU integration
 import {
@@ -107,6 +107,7 @@ TOOLS:
 export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
   // Voice state
   private voiceActive = false;
+  private _voiceStreamingMsgId: string | null = null;
   private _sfuStateCache: SfuVoiceState | null = null;
 
   // ---------------------------------------------------------------------------
@@ -279,9 +280,6 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
 
   /** TTS SFU subscriber WebSocket */
   private _ttsSfuSocket: WebSocket | null = null;
-
-  /** Active SSE subscriptions per sessionId — prevents duplicate loops */
-  private _activeSubscriptions = new Map<string, boolean>();
 
   /**
    * POST /voice/tts/publish — Create SFU WebSocket adapter for TTS.
@@ -700,6 +698,35 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
   }
 
   // ---------------------------------------------------------------------------
+  // Voice hooks — emit transcripts and responses to the chat UI
+  // ---------------------------------------------------------------------------
+
+  protected override onVoiceTranscript(text: string): void {
+    this.broadcast(JSON.stringify({ type: 'voice:transcript', text }));
+    this.broadcast(JSON.stringify({
+      type: 'chat:message',
+      id: `voice-user-${Date.now()}`,
+      role: 'user',
+      content: text,
+    }));
+  }
+
+  protected override onVoiceResponseChunk(chunk: string, msgId: string): void {
+    // On first chunk, open the streaming message
+    if (!this._voiceStreamingMsgId) {
+      this._voiceStreamingMsgId = msgId;
+      this.broadcast(JSON.stringify({ type: 'chat:stream:start', id: msgId }));
+    }
+    this.broadcast(JSON.stringify({ type: 'chat:stream:chunk', id: msgId, content: chunk }));
+  }
+
+  protected override onVoiceResponse(text: string): void {
+    const msgId = this._voiceStreamingMsgId ?? `voice-asst-${Date.now()}`;
+    this._voiceStreamingMsgId = null;
+    this.broadcast(JSON.stringify({ type: 'chat:stream:end', id: msgId, content: text }));
+  }
+
+  // ---------------------------------------------------------------------------
   // Text chat — @callable RPC (lifted from ChatAgent)
   // ---------------------------------------------------------------------------
 
@@ -799,61 +826,6 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
   }
 
   // ---------------------------------------------------------------------------
-  // SSE event subscription — background loop per session
-  // ---------------------------------------------------------------------------
-
-  /**
-   * Subscribe to opencode SSE events for a session. Runs as a detached
-   * background loop (fire-and-forget). Broadcasts each event to connected
-   * browsers and injects a summary into the conversation on session.idle /
-   * session.error so the orchestrator LLM can notify the user.
-   */
-  private startEventSubscription(
-    client: { client: { event: { subscribe: (opts: any) => Promise<{ stream: AsyncIterable<OcEvent> }> } } },
-    sessionId: string,
-    label: string,
-  ): void {
-    if (this._activeSubscriptions.get(sessionId)) return; // already subscribed
-    this._activeSubscriptions.set(sessionId, true);
-
-    // Detached async IIFE — intentionally not awaited
-    (async () => {
-      try {
-        const sse = await (client as any).client.event.subscribe({ directory: WORK_DIR });
-        for await (const event of sse.stream as AsyncIterable<OcEvent>) {
-          // Only emit events for our session where possible
-          const props = (event as any).properties ?? {};
-          if (props.sessionID && props.sessionID !== sessionId) continue;
-
-          const payload = JSON.stringify({ type: 'agent:event', sessionId, label, event });
-          this.broadcast(payload);
-
-          // On idle or error — inject summary into LLM history and notify user
-          if (event.type === 'session.idle' || event.type === 'session.error') {
-            const isError = event.type === 'session.error';
-            const summary = isError
-              ? `Agent session ${sessionId} (${label}) encountered an error: ${JSON.stringify(props.error ?? 'unknown error')}`
-              : `Agent session ${sessionId} (${label}) completed a turn and is now idle.`;
-
-            this.history.push({ role: 'user', content: `[system] ${summary}` });
-            this.history.push({ role: 'assistant', content: isError ? `Error in agent: ${label}.` : `Done: ${label}.` });
-
-            // Broadcast a notification message to the chat UI
-            const notifId = `notif_${Date.now()}`;
-            this.broadcast(JSON.stringify({ type: 'chat:stream:start', id: notifId }));
-            this.broadcast(JSON.stringify({ type: 'chat:stream:end', id: notifId, content: summary }));
-
-            if (isError) break; // stop listening after an error
-          }
-        }
-      } catch (e) {
-        console.error(`[SSE] Subscription error for session ${sessionId}:`, e);
-      } finally {
-        this._activeSubscriptions.delete(sessionId);
-      }
-    })();
-  }
-
   // ---------------------------------------------------------------------------
   // Tool definitions
   // ---------------------------------------------------------------------------
@@ -925,8 +897,27 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
             parts: [{ type: 'text', text: fullPrompt }],
           });
 
-          // Start background SSE subscription to monitor the agent
-          this.startEventSubscription({ client }, session.data.id, `${issueId}`);
+          // Start the container-side event forwarder (fire-and-forget)
+          // It streams opencode SSE → POST /internal/append-event on the Worker
+          sandbox.exec(
+            `node /usr/local/bin/forwarder.js`,
+            {
+              env: {
+                OPENCODE_PORT: '4096',
+                WORKER_URL: env.WORKER_URL,
+                SESSION_ID: session.data.id,
+                SESSION_LABEL: String(issueId),
+                INTERNAL_SECRET: env.INTERNAL_SECRET,
+              },
+            },
+          ).catch((e: unknown) => console.error('[forwarder] exec error:', e));
+
+          // Notify browser to start polling for events from this session
+          this.broadcast(JSON.stringify({
+            type: 'agent:session:started',
+            sessionId: session.data.id,
+            label: String(issueId),
+          }));
 
           await (sandbox as unknown as Sandbox).logSession({
             sessionId: session.data.id,
@@ -1004,9 +995,27 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
             parts: [{ type: 'text', text: fullPrompt }],
           });
 
-          // Start background SSE subscription to monitor the agent
+          // Start the container-side event forwarder (fire-and-forget)
           const sessionLabel = args.workspace ?? args.repo ?? 'agent';
-          this.startEventSubscription({ client }, session.data.id, sessionLabel);
+          sandbox.exec(
+            `node /usr/local/bin/forwarder.js`,
+            {
+              env: {
+                OPENCODE_PORT: '4096',
+                WORKER_URL: env.WORKER_URL,
+                SESSION_ID: session.data.id,
+                SESSION_LABEL: sessionLabel,
+                INTERNAL_SECRET: env.INTERNAL_SECRET,
+              },
+            },
+          ).catch((e: unknown) => console.error('[forwarder] exec error:', e));
+
+          // Notify browser to start polling for events from this session
+          this.broadcast(JSON.stringify({
+            type: 'agent:session:started',
+            sessionId: session.data.id,
+            label: sessionLabel,
+          }));
 
           const workspaceKey = args.workspace ? `named/${args.workspace}` : undefined;
           await (sandbox as unknown as Sandbox).logSession({

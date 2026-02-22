@@ -24,6 +24,10 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 COPY bin/lb /usr/local/bin/lb
 RUN chmod +x /usr/local/bin/lb
 
+# Install event forwarder (streams opencode SSE → Worker /internal/append-event)
+COPY bin/forwarder.js /usr/local/bin/forwarder.js
+RUN chmod +x /usr/local/bin/forwarder.js
+
 # Pre-install local MCP servers so they're available without npm download delay
 # (context7 and ref-tools-docs are remote MCP — no local install needed)
 RUN npm install -g @modelcontextprotocol/server-fetch 2>/dev/null || true

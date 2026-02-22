@@ -28,6 +28,7 @@ import { handleKickoff } from './handlers/kickoff.js';
 import { handleMessages, handleSessionStatus, handleFollowUp, handleListSessions, handleSnapshot } from './handlers/session.js';
 import { handleExec } from './handlers/exec.js';
 import { handleWorkspaceSave, handleWorkspaceList, handleWorkspaceDelete, handleWorkspaceFile } from './handlers/workspace.js';
+import { Sandbox as SandboxDO } from './sandbox.js';
 
 // Re-export DO classes (required by wrangler bindings)
 export { Sandbox } from './sandbox.js';
@@ -41,6 +42,21 @@ export default {
     // Health check
     if (url.pathname === '/health') {
       return Response.json({ status: 'ok', timestamp: new Date().toISOString() });
+    }
+
+    // --- Internal: container forwarder → Sandbox DO (append-event) ---
+    // The forwarder process in the container POSTs here; we forward to the Sandbox DO.
+    if (request.method === 'POST' && url.pathname === '/internal/append-event') {
+      return (sandbox as unknown as SandboxDO).fetch(request);
+    }
+
+    // --- Public: browser polls for buffered session events ---
+    const eventsMatch = url.pathname.match(/^\/api\/session\/([^/]+)\/events$/);
+    if (request.method === 'GET' && eventsMatch) {
+      const sessionId = eventsMatch[1];
+      const since = Number(url.searchParams.get('since') ?? '0');
+      const rows = (sandbox as unknown as SandboxDO).getEvents(sessionId, since);
+      return Response.json({ events: rows });
     }
 
     // --- Voice signaling routes → Orchestrator DO ---

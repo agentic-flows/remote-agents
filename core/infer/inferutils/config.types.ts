@@ -88,6 +88,19 @@ const MODELS_MASTER = {
       nonReasoning: true,
     },
   },
+  GPT_4_1: {
+    id: "openai/gpt-4.1",
+    config: {
+      name: "GPT-4.1",
+      size: ModelSize.LARGE,
+      provider: "openai",
+      creditCost: 4,
+      contextSize: 1047576,
+      inputCostPerMillion: 2.00,
+      outputCostPerMillion: 8.00,
+      nonReasoning: true,
+    },
+  },
 
   // --- Anthropic Models ---
   CLAUDE_4_SONNET: {

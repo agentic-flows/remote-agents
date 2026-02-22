@@ -4,6 +4,7 @@
  * Subclasses the base Sandbox from @cloudflare/sandbox to add:
  * - session_log table: tracks dispatched sessions (survives hibernation)
  * - session_messages table: captured conversation messages
+ * - session_events table: live agent events streamed from opencode SSE
  */
 import { Sandbox as BaseSandbox } from '@cloudflare/sandbox';
 
@@ -46,6 +47,44 @@ export class Sandbox extends BaseSandbox<Env> {
         FOREIGN KEY (session_id) REFERENCES session_log(session_id)
       )
     `);
+    // Live agent events forwarded from the container's forwarder process
+    ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS session_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT NOT NULL,
+        label TEXT,
+        event_type TEXT NOT NULL,
+        event_json TEXT NOT NULL,
+        ts INTEGER NOT NULL
+      )
+    `);
+    try {
+      ctx.storage.sql.exec(`CREATE INDEX IF NOT EXISTS idx_events_session_ts ON session_events (session_id, ts)`);
+    } catch {}
+  }
+
+  // ---------------------------------------------------------------------------
+  // Override fetch to intercept /internal/append-event from the container
+  // forwarder — authenticate with INTERNAL_SECRET then store the event.
+  // Everything else falls through to the base Sandbox fetch (containerFetch).
+  // ---------------------------------------------------------------------------
+  override async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.pathname === '/internal/append-event' && request.method === 'POST') {
+      const secret = (this.env as Env).INTERNAL_SECRET;
+      const auth = request.headers.get('Authorization');
+      if (!auth || auth !== `Bearer ${secret}`) {
+        return new Response('Unauthorized', { status: 401 });
+      }
+      try {
+        const body = await request.json() as { sessionId: string; label?: string; event: { type: string; [key: string]: unknown } };
+        this.appendEvent(body.sessionId, body.label ?? body.sessionId, body.event);
+        return new Response('ok');
+      } catch (e) {
+        return new Response('Bad request', { status: 400 });
+      }
+    }
+    return super.fetch(request);
   }
 
   /** Log a new session dispatch */
@@ -154,5 +193,26 @@ export class Sandbox extends BaseSandbox<Env> {
       `SELECT * FROM session_messages WHERE session_id = ? ORDER BY id ASC`,
       sessionId,
     ).toArray();
+  }
+
+  /** Append a forwarded event from the container forwarder process */
+  appendEvent(sessionId: string, label: string, event: { type: string; [key: string]: unknown }) {
+    this.ctx.storage.sql.exec(
+      `INSERT INTO session_events (session_id, label, event_type, event_json, ts) VALUES (?, ?, ?, ?, ?)`,
+      sessionId,
+      label,
+      event.type,
+      JSON.stringify(event),
+      Date.now(),
+    );
+  }
+
+  /** Get buffered events for a session since a given timestamp (ms) */
+  getEvents(sessionId: string, since: number): Array<{ id: number; session_id: string; label: string; event_type: string; event_json: string; ts: number }> {
+    return this.ctx.storage.sql.exec(
+      `SELECT id, session_id, label, event_type, event_json, ts FROM session_events WHERE session_id = ? AND ts > ? ORDER BY ts ASC LIMIT 200`,
+      sessionId,
+      since,
+    ).toArray() as any[];
   }
 }
