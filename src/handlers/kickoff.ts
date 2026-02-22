@@ -39,7 +39,6 @@ export async function handleKickoff(
 
     const repoUrl = await setupWorkspace(sandbox, env, {
       repo: body.repo,
-      project: body.project,
       branch: body.branch,
       workspace: body.workspace,
       setupLb: false,

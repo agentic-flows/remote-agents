@@ -10,6 +10,102 @@ interface ChatMessage {
   streaming?: boolean;
 }
 
+interface AgentEvent {
+  id: string;
+  event: { type: string; properties?: Record<string, unknown> };
+  timestamp: string;
+}
+
+interface AgentSession {
+  label: string;
+  events: AgentEvent[];
+}
+
+// =============================================================================
+// AGENT EVENT PANEL
+// =============================================================================
+
+const EVENT_ICONS: Record<string, string> = {
+  'file.edited': '📝',
+  'command.executed': '⚡',
+  'message.updated': '💬',
+  'session.idle': '✅',
+  'session.error': '❌',
+  'session.status': '⏳',
+};
+
+function AgentPanel({
+  sessions,
+  activeTab,
+  onTabChange,
+}: {
+  sessions: Map<string, AgentSession>;
+  activeTab: string | null;
+  onTabChange: (id: string) => void;
+}) {
+  const eventsEndRef = useRef<HTMLDivElement>(null);
+  const sessionIds = Array.from(sessions.keys());
+
+  useEffect(() => {
+    eventsEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [sessions, activeTab]);
+
+  if (sessionIds.length === 0) return null;
+
+  const currentTab = activeTab && sessions.has(activeTab) ? activeTab : sessionIds[0];
+  const currentSession = sessions.get(currentTab)!;
+
+  return (
+    <div className="agent-panel">
+      <div className="agent-panel-header">
+        <span className="agent-panel-title">Agents</span>
+        <div className="agent-tabs">
+          {sessionIds.map(id => (
+            <button
+              key={id}
+              className={`agent-tab ${currentTab === id ? 'active' : ''}`}
+              onClick={() => onTabChange(id)}
+              title={sessions.get(id)!.label}
+            >
+              {sessions.get(id)!.label.slice(0, 10)}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="agent-events">
+        {currentSession.events.map(e => (
+          <div key={e.id} className={`agent-event agent-event-${e.event.type.replace('.', '-')}`}>
+            <span className="agent-event-icon">{EVENT_ICONS[e.event.type] ?? '▸'}</span>
+            <span className="agent-event-body">
+              <span className="agent-event-type">{e.event.type}</span>
+              {e.event.properties && Object.keys(e.event.properties).length > 0 && (
+                <span className="agent-event-props">
+                  {formatEventProps(e.event.type, e.event.properties)}
+                </span>
+              )}
+            </span>
+            <span className="agent-event-time">
+              {new Date(e.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+            </span>
+          </div>
+        ))}
+        <div ref={eventsEndRef} />
+      </div>
+    </div>
+  );
+}
+
+function formatEventProps(type: string, props: Record<string, unknown>): string {
+  if (type === 'file.edited') return String(props.file ?? '');
+  if (type === 'command.executed') return String(props.name ?? '');
+  if (type === 'session.error') {
+    const err = props.error as any;
+    return err?.message ?? err?.data?.message ?? JSON.stringify(err ?? '').slice(0, 60);
+  }
+  if (type === 'session.status') return String(props.status ?? '');
+  return '';
+}
+
 // =============================================================================
 // VOICE HOOK — WebRTC via Cloudflare Calls SFU
 // =============================================================================
@@ -195,6 +291,10 @@ function useVoice(agent: ReturnType<typeof useAgent>, connected: boolean) {
         const audio = document.createElement('audio');
         audio.srcObject = event.streams[0];
         audio.autoplay = true;
+        // Must be in the DOM for autoplay to work in browsers
+        audio.style.display = 'none';
+        document.body.appendChild(audio);
+        audio.play().catch((e) => console.warn('[WebRTC] Audio play() rejected:', e));
         audioElementRef.current = audio;
       };
 
@@ -399,6 +499,7 @@ registerProcessor('pcm-capture', PcmCaptureProcessor);
     if (audioElementRef.current) {
       audioElementRef.current.pause();
       audioElementRef.current.srcObject = null;
+      audioElementRef.current.remove();
       audioElementRef.current = null;
     }
 
@@ -512,6 +613,8 @@ export function App() {
   const [isStreaming, setIsStreaming] = useState(false);
   const [connected, setConnected] = useState(false);
   const [agentState, setAgentState] = useState<any>(null);
+  const [agentSessions, setAgentSessions] = useState<Map<string, AgentSession>>(new Map());
+  const [activeSessionTab, setActiveSessionTab] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const streamingContentRef = useRef<string>('');
@@ -523,6 +626,8 @@ export function App() {
     handleVoiceMessage: (data: any) => void;
     handleBinaryMessage: (data: ArrayBuffer) => void;
   }>({ handleVoiceMessage: () => {}, handleBinaryMessage: () => {} });
+
+  const handleMessageRef = useRef<(data: any) => void>(() => {});
 
   const agent = useAgent({
     agent: 'orchestrator',
@@ -551,7 +656,7 @@ export function App() {
           return;
         }
 
-        handleMessage(data);
+        handleMessageRef.current(data);
       } catch {
         // non-JSON message
       }
@@ -622,8 +727,34 @@ export function App() {
         }
         break;
       }
+
+      case 'agent:event': {
+        const { sessionId, label, event } = data as {
+          sessionId: string;
+          label: string;
+          event: { type: string; properties?: Record<string, unknown> };
+        };
+        setAgentSessions(prev => {
+          const next = new Map(prev);
+          const session = next.get(sessionId) ?? { label, events: [] };
+          const newEvent: AgentEvent = {
+            id: `${sessionId}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            event,
+            timestamp: new Date().toISOString(),
+          };
+          next.set(sessionId, { ...session, events: [...session.events.slice(-199), newEvent] });
+          return next;
+        });
+        setActiveSessionTab(prev => prev ?? sessionId);
+        break;
+      }
     }
   }, []);
+
+  // Keep handleMessageRef in sync
+  useEffect(() => {
+    handleMessageRef.current = handleMessage;
+  }, [handleMessage]);
 
   // Auto-scroll to bottom
   useEffect(() => {
@@ -704,86 +835,98 @@ export function App() {
         </div>
       </header>
 
-      <main className="messages">
-        {messages.length === 0 && !voice.voiceActive && (
-          <div className="empty-state">
-            <p className="empty-title">Chat with the Orchestrator</p>
-            <p className="empty-hint">
-              Try: "What issues are ready?" or "List sessions" or "Kickoff a research task"
-            </p>
-            <p className="empty-hint">
-              Or click the mic button to talk.
-            </p>
-          </div>
-        )}
-        {messages.map(msg => (
-          <div key={msg.id} className={`message ${msg.role}`}>
-            <div className="message-header">
-              <span className="message-role">{msg.role === 'user' ? 'You' : 'Orchestrator'}</span>
-              <span className="message-time">
-                {new Date(msg.timestamp).toLocaleTimeString()}
-              </span>
-            </div>
-            <div className="message-content">
-              {msg.content || (msg.streaming ? <span className="typing">Thinking...</span> : '')}
-            </div>
-          </div>
-        ))}
-        <div ref={messagesEndRef} />
-      </main>
+      <div className={`workspace ${agentSessions.size > 0 ? 'split' : ''}`}>
+        <div className="chat-pane">
+          <main className="messages">
+            {messages.length === 0 && !voice.voiceActive && (
+              <div className="empty-state">
+                <p className="empty-title">Chat with the Orchestrator</p>
+                <p className="empty-hint">
+                  Try: "What issues are ready?" or "List sessions" or "Kickoff a research task"
+                </p>
+                <p className="empty-hint">
+                  Or click the mic button to talk.
+                </p>
+              </div>
+            )}
+            {messages.map(msg => (
+              <div key={msg.id} className={`message ${msg.role}`}>
+                <div className="message-header">
+                  <span className="message-role">{msg.role === 'user' ? 'You' : 'Orchestrator'}</span>
+                  <span className="message-time">
+                    {new Date(msg.timestamp).toLocaleTimeString()}
+                  </span>
+                </div>
+                <div className="message-content">
+                  {msg.content || (msg.streaming ? <span className="typing">Thinking...</span> : '')}
+                </div>
+              </div>
+            ))}
+            <div ref={messagesEndRef} />
+          </main>
 
-      {/* Voice transcript overlay */}
-      {voice.voiceActive && voice.transcript && (
-        <div className="voice-transcript">
-          <span className="voice-transcript-text">{voice.transcript}</span>
-        </div>
-      )}
-
-      <footer className="input-area">
-        <button
-          className={`mic-btn ${voice.voiceActive ? 'active' : ''} ${voice.voiceConnecting ? 'connecting' : ''}`}
-          onClick={toggleVoice}
-          disabled={!connected}
-          title={voice.voiceActive ? 'Stop voice' : 'Start voice'}
-        >
-          {voice.voiceConnecting ? (
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <circle cx="12" cy="12" r="10" strokeDasharray="32" strokeDashoffset="32">
-                <animate attributeName="stroke-dashoffset" from="32" to="0" dur="1s" repeatCount="indefinite" />
-              </circle>
-            </svg>
-          ) : (
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="9" y="1" width="6" height="14" rx="3" />
-              <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
-              <line x1="12" y1="23" x2="12" y2="19" />
-            </svg>
+          {/* Voice transcript overlay */}
+          {voice.voiceActive && voice.transcript && (
+            <div className="voice-transcript">
+              <span className="voice-transcript-text">{voice.transcript}</span>
+            </div>
           )}
-        </button>
-        <textarea
-          ref={inputRef}
-          className="input"
-          value={input}
-          onChange={e => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder={
-            voice.voiceActive
-              ? 'Voice mode active — speak or type...'
-              : isStreaming
-                ? 'Waiting for response...'
-                : 'Message the Orchestrator...'
-          }
-          disabled={isStreaming || !connected}
-          rows={1}
-        />
-        <button
-          className="send-btn"
-          onClick={sendMessage}
-          disabled={!input.trim() || isStreaming || !connected}
-        >
-          Send
-        </button>
-      </footer>
+
+          <footer className="input-area">
+            <button
+              className={`mic-btn ${voice.voiceActive ? 'active' : ''} ${voice.voiceConnecting ? 'connecting' : ''}`}
+              onClick={toggleVoice}
+              disabled={!connected}
+              title={voice.voiceActive ? 'Stop voice' : 'Start voice'}
+            >
+              {voice.voiceConnecting ? (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="12" cy="12" r="10" strokeDasharray="32" strokeDashoffset="32">
+                    <animate attributeName="stroke-dashoffset" from="32" to="0" dur="1s" repeatCount="indefinite" />
+                  </circle>
+                </svg>
+              ) : (
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="9" y="1" width="6" height="14" rx="3" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="23" x2="12" y2="19" />
+                </svg>
+              )}
+            </button>
+            <textarea
+              ref={inputRef}
+              className="input"
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={handleKeyDown}
+              placeholder={
+                voice.voiceActive
+                  ? 'Voice mode active — speak or type...'
+                  : isStreaming
+                    ? 'Waiting for response...'
+                    : 'Message the Orchestrator...'
+              }
+              disabled={isStreaming || !connected}
+              rows={1}
+            />
+            <button
+              className="send-btn"
+              onClick={sendMessage}
+              disabled={!input.trim() || isStreaming || !connected}
+            >
+              Send
+            </button>
+          </footer>
+        </div>
+
+        {agentSessions.size > 0 && (
+          <AgentPanel
+            sessions={agentSessions}
+            activeTab={activeSessionTab}
+            onTabChange={setActiveSessionTab}
+          />
+        )}
+      </div>
     </div>
   );
 }

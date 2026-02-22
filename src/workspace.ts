@@ -27,7 +27,6 @@ export async function setupWorkspace(
   env: Env,
   opts: {
     repo?: string;
-    project?: string;
     branch?: string;
     setupLb?: boolean;
     workspace?: string; // named workspace to restore from R2
@@ -36,34 +35,39 @@ export async function setupWorkspace(
   // Clean workspace
   await sandbox.exec(`cd /tmp && rm -rf ${WORK_DIR}`);
 
+  // ---- Git identity + gh auth first (must precede any git/gh operations) ----
+  if (env.GIT_AUTHOR_NAME) {
+    await sandbox.exec(`git config --global user.name "${env.GIT_AUTHOR_NAME}"`);
+  }
+  if (env.GIT_AUTHOR_EMAIL) {
+    await sandbox.exec(`git config --global user.email "${env.GIT_AUTHOR_EMAIL}"`);
+  }
+  await sandbox.exec(`git config --global --add safe.directory ${WORK_DIR}`);
+  if (env.GH_TOKEN) {
+    await sandbox.exec(`echo "${env.GH_TOKEN}" | gh auth login --with-token`);
+    await sandbox.exec(`git config --global credential.helper "!gh auth git-credential"`);
+  }
+
+  // Inject secrets into container environment
+  const envLines: string[] = [];
+  if (env.LINEAR_API_KEY) envLines.push(`LINEAR_API_KEY=${env.LINEAR_API_KEY}`);
+  if (env.GH_TOKEN) envLines.push(`GH_TOKEN=${env.GH_TOKEN}`);
+  if (env.ANTHROPIC_API_KEY) envLines.push(`ANTHROPIC_API_KEY=${env.ANTHROPIC_API_KEY}`);
+  if (env.GIT_AUTHOR_NAME) envLines.push(`GIT_AUTHOR_NAME=${env.GIT_AUTHOR_NAME}`);
+  if (env.GIT_AUTHOR_EMAIL) envLines.push(`GIT_AUTHOR_EMAIL=${env.GIT_AUTHOR_EMAIL}`);
+  if (envLines.length > 0) {
+    const exports = envLines.map((l) => `export ${l}`).join('\n');
+    await sandbox.exec(`echo '${exports}' >> /root/.bashrc`);
+    await sandbox.exec(exports);
+  }
+  // ---------------------------------------------------------------------------
+
   let repoUrl: string | null = null;
 
   if (opts.repo) {
     // Clone existing repo
     await sandbox.gitCheckout(opts.repo, { targetDir: WORK_DIR });
     repoUrl = opts.repo;
-  } else if (opts.project && env.GH_TOKEN) {
-    // Check if repo already exists, if so clone it; otherwise create it
-    const check = await sandbox.exec(
-      `gh repo view agentic-flows/${opts.project} --json url 2>&1`,
-    );
-    if (check.stdout?.includes('url')) {
-      // Repo exists — clone it
-      const parsed = JSON.parse(check.stdout);
-      repoUrl = parsed.url + '.git';
-      await sandbox.gitCheckout(repoUrl, { targetDir: WORK_DIR });
-    } else {
-      // Create new repo with an initial commit so --push works
-      await sandbox.exec(`mkdir -p ${WORK_DIR}`);
-      await sandbox.exec(`cd ${WORK_DIR} && git init -b main`);
-      await sandbox.exec(
-        `cd ${WORK_DIR} && echo "# ${opts.project}" > README.md && git add README.md && git commit -m "init"`,
-      );
-      await sandbox.exec(
-        `cd ${WORK_DIR} && gh repo create agentic-flows/${opts.project} --private --source=. --push 2>&1`,
-      );
-      repoUrl = `https://github.com/agentic-flows/${opts.project}.git`;
-    }
   } else if (opts.workspace) {
     // Named workspace — try to restore from R2 first
     let restored = false;
@@ -82,37 +86,6 @@ export async function setupWorkspace(
     // Bare workspace — no git remote
     await sandbox.exec(`mkdir -p ${WORK_DIR}`);
     await sandbox.exec(`cd ${WORK_DIR} && git init -b main`);
-  }
-
-  // Git identity
-  if (env.GIT_AUTHOR_NAME) {
-    await sandbox.exec(`git config --global user.name "${env.GIT_AUTHOR_NAME}"`);
-  }
-  if (env.GIT_AUTHOR_EMAIL) {
-    await sandbox.exec(`git config --global user.email "${env.GIT_AUTHOR_EMAIL}"`);
-  }
-  await sandbox.exec(`git config --global --add safe.directory ${WORK_DIR}`);
-
-  // GitHub CLI auth + git credential helper (so git push works via gh)
-  if (env.GH_TOKEN) {
-    await sandbox.exec(`echo "${env.GH_TOKEN}" | gh auth login --with-token`);
-    await sandbox.exec(`git config --global credential.helper "!gh auth git-credential"`);
-  }
-
-  // Inject secrets into container environment (persists for all subsequent exec calls)
-  // Write them to /etc/environment so all processes (including opencode's bash tool) see them
-  const envLines: string[] = [];
-  if (env.LINEAR_API_KEY) envLines.push(`LINEAR_API_KEY=${env.LINEAR_API_KEY}`);
-  if (env.GH_TOKEN) envLines.push(`GH_TOKEN=${env.GH_TOKEN}`);
-  if (env.ANTHROPIC_API_KEY) envLines.push(`ANTHROPIC_API_KEY=${env.ANTHROPIC_API_KEY}`);
-  if (env.GIT_AUTHOR_NAME) envLines.push(`GIT_AUTHOR_NAME=${env.GIT_AUTHOR_NAME}`);
-  if (env.GIT_AUTHOR_EMAIL) envLines.push(`GIT_AUTHOR_EMAIL=${env.GIT_AUTHOR_EMAIL}`);
-  if (envLines.length > 0) {
-    // Write to profile so interactive and non-interactive shells pick them up
-    const exports = envLines.map((l) => `export ${l}`).join('\n');
-    await sandbox.exec(`echo '${exports}' >> /root/.bashrc`);
-    // Also set them in the current shell context for immediate use
-    await sandbox.exec(exports);
   }
 
   // Checkout branch if specified

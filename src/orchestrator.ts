@@ -29,7 +29,8 @@ import { infer } from '../core/infer/inferutils/core.js';
 import { WORK_DIR, DEFAULT_MODEL, AGENT_PROFILES, getClient } from './config.js';
 import { setupWorkspace, saveWorkspace, restoreWorkspace, resolveWorkspaceKey } from './workspace.js';
 import { Sandbox } from './sandbox.js';
-import type { Config } from '@opencode-ai/sdk';
+import { listIssues, getIssue, updateIssueState, createIssue, formatIssueList, formatIssueDetail } from './linear.js';
+import type { Config, Event as OcEvent } from '@opencode-ai/sdk';
 
 // SFU integration
 import {
@@ -51,7 +52,7 @@ interface OrchestratorState extends VoiceAgentState {
   lastActivity: string | null;
 }
 
-/** SFU session state tracked in memory (not persisted — voice sessions are ephemeral) */
+/** SFU session state persisted in DO storage to survive hibernation */
 interface SfuVoiceState {
   // TTS publish path (DO → SFU → browser)
   ttsSessionId: string;       // SFU session for the TTS track
@@ -75,40 +76,29 @@ const TTS_BUFFER_CHUNK_SIZE = 8192;
 // SYSTEM PROMPT
 // =============================================================================
 
-const SYSTEM_PROMPT = `You are the Orchestrator — a remote coding agent manager running on Cloudflare Workers.
+const SYSTEM_PROMPT = `You are a voice-controlled command dispatcher for coding agents.
 
-You manage coding agents that run inside Cloudflare Containers. Each container runs opencode serve (an AI coding agent) that can write code, run commands, create PRs, and more.
+RULES — NO EXCEPTIONS:
+- Maximum 1 sentence per response. Usually just 2-5 words is enough.
+- Do not explain anything. Do not confirm unless something is genuinely ambiguous.
+- Do not describe what you're about to do. Just do it, then say what happened.
+- Never say "I", "Sure", "Got it", "Of course", "I'll", or any filler.
+- Bad: "Sure! I'll dispatch that issue to a remote agent right away."
+- Good: "Dispatching AGE-42." then call the tool.
+- After a tool succeeds: one short fact. "Done. Container starting."
+- After a tool fails: one short fact. "Failed — no repo URL."
 
-## Your Capabilities
-
-You have tools to:
-- **Dispatch issues**: Set up a container with a cloned repo, lb integration, and send it an issue to work on
-- **Kickoff tasks**: Send raw prompts to containers (no lb integration needed)
-- **Monitor sessions**: Check session status, read messages, list all sessions
-- **Send follow-ups**: Send additional instructions to running agents
-- **Execute commands**: Run shell commands directly in the container
-- **Read files**: Read files from the container workspace
-- **Manage workspaces**: Save/restore/list/delete R2 workspaces
-- **Track issues**: Use lb to view ready issues, show issue details, list/sync issues
-
-## How to Use Your Tools
-
-1. When the user wants to work on an issue: use \`lb_ready\` to find work, then \`dispatch_issue\` to launch an agent
-2. When the user wants a raw task: use \`kickoff\` with a prompt
-3. To check progress: use \`check_session\` or \`list_sessions\`
-4. To send more instructions: use \`send_message\`
-5. To debug: use \`exec_command\` to run shell commands or \`read_file\` to inspect code
-
-## Important Notes
-
-- Containers take ~30 seconds to start. Be patient after dispatch/kickoff.
-- Sessions are async — after dispatching, the agent works independently.
-- Use \`check_session\` to poll for completion.
-- The container has git, gh CLI, lb CLI, and opencode pre-installed.
-- All agents use the free opencode/big-pickle model by default.
-- Workspaces can be persisted to R2 between sessions.
-
-Be concise and helpful. Report tool results clearly. If a tool fails, explain why and suggest alternatives.`;
+TOOLS:
+- linear_issues(stateNames?, stateTypes?) — list Linear issues (no container needed)
+- linear_show(issueId) — full issue details
+- linear_update_status(issueId, status) — update issue state
+- linear_create(title, description?) — create new issue
+- create_repo(name, description?) — create a private GitHub repo under agentic-flows/, returns repoUrl
+- dispatch_issue(issueId, repo) — launch container agent on a Linear issue
+- kickoff(text, repo?) — launch container agent with a raw prompt
+- check_session(sessionId) — poll agent status
+- send_message(sessionId, text) — send instructions to running agent
+- exec_command / read_file — debug inside container`;
 
 // =============================================================================
 // ORCHESTRATOR
@@ -117,7 +107,31 @@ Be concise and helpful. Report tool results clearly. If a tool fails, explain wh
 export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
   // Voice state
   private voiceActive = false;
-  private sfuState: SfuVoiceState | null = null;
+  private _sfuStateCache: SfuVoiceState | null = null;
+
+  // ---------------------------------------------------------------------------
+  // sfuState: persisted in DO storage to survive hibernation
+  // ---------------------------------------------------------------------------
+
+  private get sfuState(): SfuVoiceState | null {
+    return this._sfuStateCache;
+  }
+
+  private set sfuState(value: SfuVoiceState | null) {
+    this._sfuStateCache = value;
+    // Fire-and-forget persistence — hibernation-safe
+    if (value === null) {
+      this.ctx.storage.delete('sfuState').catch(() => {});
+    } else {
+      this.ctx.storage.put('sfuState', value).catch(() => {});
+    }
+  }
+
+  private async loadSfuState(): Promise<void> {
+    if (this._sfuStateCache !== undefined) return; // already loaded or explicitly null
+    const stored = await this.ctx.storage.get<SfuVoiceState>('sfuState');
+    this._sfuStateCache = stored ?? null;
+  }
 
   initialState: OrchestratorState = {
     callSid: null,
@@ -161,6 +175,31 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
   // ---------------------------------------------------------------------------
 
   /**
+   * Override fetch() to intercept SFU WebSocket upgrade requests before
+   * partyserver (the base class) can swallow them.
+   *
+   * partyserver's fetch() (partyserver/dist/index.js:394) intercepts ALL
+   * WebSocket upgrades and treats them as partykit client connections —
+   * it never calls onRequest() for WebSocket requests. This means the SFU's
+   * callback connections to /voice/tts/subscribe and /voice/stt/sfu-subscribe
+   * would be silently mishandled without this override.
+   */
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+      if (url.pathname.endsWith('/voice/tts/subscribe')) {
+        await this.loadSfuState();
+        return this.handleTtsSubscribe();
+      }
+      if (url.pathname.endsWith('/voice/stt/sfu-subscribe')) {
+        await this.loadSfuState();
+        return this.handleSttSfuSubscribe();
+      }
+    }
+    return super.fetch(request);
+  }
+
+  /**
    * Handle non-WebSocket HTTP requests to the Orchestrator DO.
    * The Agent SDK calls this for requests that aren't WebSocket upgrades.
    *
@@ -177,16 +216,11 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
     const url = new URL(request.url);
     const path = url.pathname;
 
-    // WebSocket upgrade requests from the SFU
-    if (request.headers.get('Upgrade') === 'websocket') {
-      if (path.endsWith('/voice/tts/subscribe')) {
-        return this.handleTtsSubscribe();
-      }
-      if (path.endsWith('/voice/stt/sfu-subscribe')) {
-        return this.handleSttSfuSubscribe();
-      }
-      return new Response('Unknown WebSocket endpoint', { status: 404 });
-    }
+    // Load persisted SFU state on every request (survives DO hibernation)
+    await this.loadSfuState();
+
+    // Note: WebSocket upgrades are handled in fetch() before partyserver sees them.
+    // onRequest() is only called for non-WebSocket HTTP requests.
 
     // HTTP POST endpoints for signaling
     if (request.method === 'POST') {
@@ -246,6 +280,9 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
   /** TTS SFU subscriber WebSocket */
   private _ttsSfuSocket: WebSocket | null = null;
 
+  /** Active SSE subscriptions per sessionId — prevents duplicate loops */
+  private _activeSubscriptions = new Map<string, boolean>();
+
   /**
    * POST /voice/tts/publish — Create SFU WebSocket adapter for TTS.
    * The SFU will connect back to our /voice/tts/subscribe endpoint to receive audio.
@@ -254,8 +291,16 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
     if (!this.hasSfuCredentials()) {
       return new Response('SFU credentials not configured', { status: 500 });
     }
+
+    // If stale sfuState exists (e.g. DO hibernated mid-session), clean it up and re-publish.
     if (this.sfuState?.ttsAdapterId) {
-      return new Response('TTS already published', { status: 409 });
+      console.log('[SFU/TTS] Stale TTS adapter detected — cleaning up before re-publishing');
+      try {
+        const sfu = new SfuClient(this.getSfuConfig());
+        await sfu.closeWebSocketAdapter(this.sfuState.ttsAdapterId);
+      } catch {}
+      this.sfuState = null;
+      this._ttsSfuSocket = null;
     }
 
     const trackName = `orchestrator-tts-${Date.now()}`;
@@ -276,6 +321,25 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
       };
 
       console.log(`[SFU/TTS] Published. Session: ${sessionId}, Adapter: ${adapterId}`);
+
+      // Wait for SFU to connect back on /voice/tts/subscribe before returning.
+      // The SFU calls back asynchronously after pushTrackFromWebSocket. If we return
+      // immediately, the browser may call /voice/tts/connect before _ttsSfuSocket is set,
+      // causing pullRemoteTrackToPlayer to return requiresImmediateRenegotiation: true.
+      // Waiting here ensures the track is live by the time the browser calls connect.
+      await new Promise<void>((resolve, reject) => {
+        if (this._ttsSfuSocket) { resolve(); return; }
+        const timeout = setTimeout(() => reject(new Error('SFU subscriber timeout after 5s')), 5000);
+        const check = setInterval(() => {
+          if (this._ttsSfuSocket) {
+            clearInterval(check);
+            clearTimeout(timeout);
+            resolve();
+          }
+        }, 50);
+      });
+
+      console.log('[SFU/TTS] Subscriber WebSocket connected — track is live');
       return Response.json({ sessionId, adapterId, trackName, ...json });
     } catch (e: any) {
       console.error('[SFU/TTS] Publish failed:', e.message);
@@ -564,7 +628,10 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
               ws.send(encodePcmForSfu(new ArrayBuffer(0)));
             }
             this.broadcast(JSON.stringify({ type: 'voice:tts:done' }));
-            this.setIsSpeaking(false);
+            // Delay clearing isSpeaking to cover speaker-to-mic round-trip latency.
+            // Audio is still playing through speakers when onTTSFlushed fires — clearing
+            // immediately lets STT pick up TTS echo as user speech.
+            this.clearIsSpeakingAfterDelay();
           },
           onBargeIn: () => {
             this.broadcast(JSON.stringify({ type: 'voice:tts:clear' }));
@@ -580,7 +647,8 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
           },
           onTTSFlushed: () => {
             this.broadcast(JSON.stringify({ type: 'voice:tts:done' }));
-            this.setIsSpeaking(false);
+            // Delay clearing isSpeaking to cover speaker-to-mic round-trip latency.
+            this.clearIsSpeakingAfterDelay();
           },
           onBargeIn: () => {
             this.broadcast(JSON.stringify({ type: 'voice:tts:clear' }));
@@ -661,7 +729,7 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
       metadata: { agentId: 'orchestrator', userId: 'chat-user' },
       actionKey: 'testModelConfig',
       messages,
-      modelName: 'openai/gpt-4.1-nano',
+      modelName: 'openai/gpt-4.1',
       tools,
       maxTokens: 8192,
       temperature: 0.3,
@@ -728,6 +796,62 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
       sfuActive: !!this.sfuState,
       timestamp: new Date().toISOString(),
     };
+  }
+
+  // ---------------------------------------------------------------------------
+  // SSE event subscription — background loop per session
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Subscribe to opencode SSE events for a session. Runs as a detached
+   * background loop (fire-and-forget). Broadcasts each event to connected
+   * browsers and injects a summary into the conversation on session.idle /
+   * session.error so the orchestrator LLM can notify the user.
+   */
+  private startEventSubscription(
+    client: { client: { event: { subscribe: (opts: any) => Promise<{ stream: AsyncIterable<OcEvent> }> } } },
+    sessionId: string,
+    label: string,
+  ): void {
+    if (this._activeSubscriptions.get(sessionId)) return; // already subscribed
+    this._activeSubscriptions.set(sessionId, true);
+
+    // Detached async IIFE — intentionally not awaited
+    (async () => {
+      try {
+        const sse = await (client as any).client.event.subscribe({ directory: WORK_DIR });
+        for await (const event of sse.stream as AsyncIterable<OcEvent>) {
+          // Only emit events for our session where possible
+          const props = (event as any).properties ?? {};
+          if (props.sessionID && props.sessionID !== sessionId) continue;
+
+          const payload = JSON.stringify({ type: 'agent:event', sessionId, label, event });
+          this.broadcast(payload);
+
+          // On idle or error — inject summary into LLM history and notify user
+          if (event.type === 'session.idle' || event.type === 'session.error') {
+            const isError = event.type === 'session.error';
+            const summary = isError
+              ? `Agent session ${sessionId} (${label}) encountered an error: ${JSON.stringify(props.error ?? 'unknown error')}`
+              : `Agent session ${sessionId} (${label}) completed a turn and is now idle.`;
+
+            this.history.push({ role: 'user', content: `[system] ${summary}` });
+            this.history.push({ role: 'assistant', content: isError ? `Error in agent: ${label}.` : `Done: ${label}.` });
+
+            // Broadcast a notification message to the chat UI
+            const notifId = `notif_${Date.now()}`;
+            this.broadcast(JSON.stringify({ type: 'chat:stream:start', id: notifId }));
+            this.broadcast(JSON.stringify({ type: 'chat:stream:end', id: notifId, content: summary }));
+
+            if (isError) break; // stop listening after an error
+          }
+        }
+      } catch (e) {
+        console.error(`[SSE] Subscription error for session ${sessionId}:`, e);
+      } finally {
+        this._activeSubscriptions.delete(sessionId);
+      }
+    })();
   }
 
   // ---------------------------------------------------------------------------
@@ -801,6 +925,9 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
             parts: [{ type: 'text', text: fullPrompt }],
           });
 
+          // Start background SSE subscription to monitor the agent
+          this.startEventSubscription({ client }, session.data.id, `${issueId}`);
+
           await (sandbox as unknown as Sandbox).logSession({
             sessionId: session.data.id,
             issueId,
@@ -819,13 +946,12 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
         type: 'function' as const,
         function: {
           name: 'kickoff',
-          description: 'Send a raw prompt to a remote agent. No lb integration — just a container with opencode. Optionally clone a repo or create a named workspace.',
+          description: 'Send a raw prompt to a remote agent. No lb integration — just a container with opencode. Optionally clone a repo (pass the URL from create_repo) or use a named workspace.',
           parameters: {
             type: 'object',
             properties: {
               text: { type: 'string', description: 'The prompt/instructions to send to the agent' },
-              repo: { type: 'string', description: 'Git repo URL to clone (optional)' },
-              project: { type: 'string', description: 'Project name — auto-creates a GitHub repo under agentic-flows/ (optional)' },
+              repo: { type: 'string', description: 'Git repo URL to clone — use the repoUrl returned by create_repo (optional)' },
               workspace: { type: 'string', description: 'Named workspace — persists across sessions via R2 (optional)' },
               branch: { type: 'string', description: 'Git branch to checkout (optional)' },
               profile: { type: 'string', description: 'Agent profile: coder, researcher, refiner, reviewer (optional)' },
@@ -836,7 +962,6 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
         implementation: async (args: {
           text: string;
           repo?: string;
-          project?: string;
           workspace?: string;
           branch?: string;
           profile?: string;
@@ -848,7 +973,6 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
 
           const repoUrl = await setupWorkspace(sandbox, env, {
             repo: args.repo,
-            project: args.project,
             branch: args.branch,
             workspace: args.workspace,
             setupLb: false,
@@ -857,7 +981,7 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
           const mergedMcp = { ...profile?.mcp };
           const { client } = await getClient(sandbox, env, mergedMcp);
           const session = await client.session.create({
-            title: args.workspace ? `Workspace: ${args.workspace}` : args.project ? `Project: ${args.project}` : 'Remote Agent',
+            title: args.workspace ? `Workspace: ${args.workspace}` : args.repo ? `Repo: ${args.repo.split('/').pop()?.replace('.git', '')}` : 'Remote Agent',
             directory: WORK_DIR,
           });
           if (!session.data) throw new Error(`Failed to create session: ${JSON.stringify(session)}`);
@@ -879,6 +1003,10 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
             model,
             parts: [{ type: 'text', text: fullPrompt }],
           });
+
+          // Start background SSE subscription to monitor the agent
+          const sessionLabel = args.workspace ?? args.repo ?? 'agent';
+          this.startEventSubscription({ client }, session.data.id, sessionLabel);
 
           const workspaceKey = args.workspace ? `named/${args.workspace}` : undefined;
           await (sandbox as unknown as Sandbox).logSession({
@@ -1104,81 +1232,140 @@ export class Orchestrator extends VoiceAgent<Env, OrchestratorState> {
       },
 
       // =====================================================================
-      // LB (LINEAR ISSUE TRACKING)
+      // LINEAR API (direct — no container dependency)
       // =====================================================================
       {
         type: 'function' as const,
         function: {
-          name: 'lb_ready',
-          description: 'List issues that are ready to work on (todo_refined + todo_bug, unblocked).',
-          parameters: { type: 'object', properties: {}, required: [] },
+          name: 'linear_issues',
+          description: 'List Linear issues. Filter by status (e.g. "todo_refined", "in_progress", "in_review") or state type (e.g. "unstarted", "started"). Defaults to all unstarted + started issues for team AGE.',
+          parameters: {
+            type: 'object',
+            properties: {
+              stateNames: { type: 'array', items: { type: 'string' }, description: 'Filter by exact state names, e.g. ["todo_refined", "in_progress"]' },
+              stateTypes: { type: 'array', items: { type: 'string' }, description: 'Filter by state type: "unstarted", "started", "completed", "cancelled"' },
+              label: { type: 'string', description: 'Filter by label name' },
+              limit: { type: 'number', description: 'Max issues to return (default 50)' },
+            },
+            required: [],
+          },
         },
-        implementation: async () => {
-          const result = await sandbox.exec(
-            `cd ${WORK_DIR} && LINEAR_API_KEY=${env.LINEAR_API_KEY} lb ready 2>&1`,
-          );
-          return { output: result.stdout ?? '', stderr: result.stderr ?? '' };
+        implementation: async (args: { stateNames?: string[]; stateTypes?: string[]; label?: string; limit?: number }) => {
+          const issues = await listIssues(env.LINEAR_API_KEY, {
+            teamKey: 'AGE',
+            stateNames: args.stateNames,
+            stateTypes: args.stateTypes ?? (args.stateNames ? undefined : ['unstarted', 'started']),
+            label: args.label,
+            limit: args.limit,
+          });
+          return { count: issues.length, issues: formatIssueList(issues) };
         },
       },
 
       {
         type: 'function' as const,
         function: {
-          name: 'lb_show',
-          description: 'Show full details for a Linear issue — description, status, relations.',
+          name: 'linear_show',
+          description: 'Get full details of a Linear issue by identifier (e.g. "AGE-42"). Returns title, status, description, relations.',
           parameters: {
             type: 'object',
             properties: {
-              issueId: { type: 'string', description: 'Issue ID (e.g. "AGE-42")' },
+              issueId: { type: 'string', description: 'Issue identifier, e.g. "AGE-42"' },
             },
             required: ['issueId'],
           },
         },
         implementation: async (args: { issueId: string }) => {
-          const result = await sandbox.exec(
-            `cd ${WORK_DIR} && LINEAR_API_KEY=${env.LINEAR_API_KEY} lb show ${args.issueId} 2>&1`,
-          );
-          return { output: result.stdout ?? '', stderr: result.stderr ?? '' };
+          const issue = await getIssue(env.LINEAR_API_KEY, args.issueId.toUpperCase());
+          return { detail: formatIssueDetail(issue), raw: { id: issue.id, identifier: issue.identifier } };
         },
       },
 
       {
         type: 'function' as const,
         function: {
-          name: 'lb_list',
-          description: 'List all issues, optionally filtered by status or label.',
+          name: 'linear_update_status',
+          description: 'Update the status of a Linear issue. Common statuses: todo_needs_refinement, todo_refined, in_progress, in_review, done.',
           parameters: {
             type: 'object',
             properties: {
-              status: { type: 'string', description: 'Filter by status (e.g. "in_progress", "todo_refined")' },
-              label: { type: 'string', description: 'Filter by label' },
+              issueId: { type: 'string', description: 'Issue identifier, e.g. "AGE-42"' },
+              status: { type: 'string', description: 'New status name, e.g. "in_progress"' },
             },
-            required: [],
+            required: ['issueId', 'status'],
           },
         },
-        implementation: async (args: { status?: string; label?: string }) => {
-          let cmd = `cd ${WORK_DIR} && LINEAR_API_KEY=${env.LINEAR_API_KEY} lb list`;
-          if (args.status) cmd += ` --status ${args.status}`;
-          if (args.label) cmd += ` --label ${args.label}`;
-          const result = await sandbox.exec(`${cmd} 2>&1`);
-          return { output: result.stdout ?? '', stderr: result.stderr ?? '' };
+        implementation: async (args: { issueId: string; status: string }) => {
+          const issue = await getIssue(env.LINEAR_API_KEY, args.issueId.toUpperCase());
+          await updateIssueState(env.LINEAR_API_KEY, issue.id, args.status);
+          return { updated: true, issueId: args.issueId, status: args.status };
         },
       },
 
       {
         type: 'function' as const,
         function: {
-          name: 'lb_sync',
-          description: 'Sync issues with Linear — pulls latest and pushes any local changes.',
-          parameters: { type: 'object', properties: {}, required: [] },
+          name: 'linear_create',
+          description: 'Create a new Linear issue in team AGE.',
+          parameters: {
+            type: 'object',
+            properties: {
+              title: { type: 'string', description: 'Issue title' },
+              description: { type: 'string', description: 'Issue description (markdown)' },
+              parentId: { type: 'string', description: 'Parent issue identifier (e.g. "AGE-10") to create as subtask' },
+            },
+            required: ['title'],
+          },
         },
-        implementation: async () => {
-          const result = await sandbox.exec(
-            `cd ${WORK_DIR} && LINEAR_API_KEY=${env.LINEAR_API_KEY} lb sync 2>&1`,
-          );
-          return { output: result.stdout ?? '', stderr: result.stderr ?? '' };
+        implementation: async (args: { title: string; description?: string; parentId?: string }) => {
+          let resolvedParentId: string | undefined;
+          if (args.parentId) {
+            const parent = await getIssue(env.LINEAR_API_KEY, args.parentId.toUpperCase());
+            resolvedParentId = parent.id;
+          }
+          const created = await createIssue(env.LINEAR_API_KEY, {
+            teamKey: 'AGE',
+            title: args.title,
+            description: args.description,
+            parentId: resolvedParentId,
+          });
+          return { created: true, identifier: created.identifier, id: created.id };
         },
       },
+
+      // =====================================================================
+      // GITHUB REPO MANAGEMENT
+      // =====================================================================
+      {
+        type: 'function' as const,
+        function: {
+          name: 'create_repo',
+          description: 'Create a new private GitHub repository under the agentic-flows org. Returns the clone URL to pass to kickoff or dispatch_issue.',
+          parameters: {
+            type: 'object',
+            properties: {
+              name: { type: 'string', description: 'Repository name (e.g. "research-quantum-computing")' },
+              description: { type: 'string', description: 'Repository description (optional)' },
+            },
+            required: ['name'],
+          },
+        },
+        implementation: async (args: { name: string; description?: string }) => {
+          // Auth gh first, then create the repo
+          await sandbox.exec(`echo "${env.GH_TOKEN}" | gh auth login --with-token 2>&1 || true`);
+          const descFlag = args.description ? ` --description "${args.description.replace(/"/g, '')}"` : '';
+          const result = await sandbox.exec(
+            `gh repo create agentic-flows/${args.name} --private${descFlag} 2>&1`,
+          );
+          if (result.exitCode !== 0 && !result.stdout?.includes('already exists')) {
+            return { error: `Failed to create repo: ${result.stdout || result.stderr}` };
+          }
+          const repoUrl = `https://github.com/agentic-flows/${args.name}.git`;
+          return { repoUrl, name: args.name, org: 'agentic-flows' };
+        },
+      },
+
+      // LB tools intentionally excluded — available in code but not exposed to LLM
     ];
   }
 }
